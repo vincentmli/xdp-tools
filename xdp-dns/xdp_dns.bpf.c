@@ -40,7 +40,7 @@
 // do not use libc includes because this causes clang
 // to include 32bit headers on 64bit ( only ) systems.
 #define memcpy __builtin_memcpy
-#define MAX_DOMAIN_SIZE 64
+#define MAX_DOMAIN_SIZE 128
 
 struct meta_data {
 	__u16 eth_proto;
@@ -163,6 +163,18 @@ static __always_inline char *parse_dname(struct cursor *c) {
     return 0;
 }
 
+static __always_inline void *custom_memcpy(void *dest, const void *src, __u8 len) {
+    __u8 i;
+
+    // Perform the copy byte-by-byte to satisfy the BPF verifier
+    for (i = 0; i < len; i++) {
+        *((__u8 *)dest + i) = *((__u8 *)src + i);
+    }
+
+    return dest;
+}
+
+
 // Custom strlen function for BPF
 static __always_inline __u8 custom_strlen(const char *str, struct cursor *c) {
     __u8 len = 0;
@@ -192,7 +204,7 @@ int xdp_dns(struct xdp_md *ctx)
 	struct dnshdr    *dns;
 	char	*qname;
 	__u8 len = 0;
-	char domain_key[MAX_DOMAIN_SIZE] = {0};  // Buffer for map lookup
+	char domain_key[MAX_DOMAIN_SIZE + 1 ] = {0};  // Buffer for map lookup
 
 	if (bpf_xdp_adjust_meta(ctx, -(int)sizeof(struct meta_data)))
 		return XDP_PASS;
@@ -228,13 +240,16 @@ int xdp_dns(struct xdp_md *ctx)
 			}
 
 			len = custom_strlen(qname, &c);		
-			bpf_printk("%s len is %d from %pI4", qname, len, &ipv4->saddr);
+			bpf_printk("qname  %s len is %d from %pI4", qname, len, &ipv4->saddr);
 
                         //avoid R2 offset is outside of the packet error
-                        if (qname + len + 1 > c.end)
+                        if (qname + len > c.end)
 				return XDP_ABORTED; // Return FORMERR?
 
-			memcpy(domain_key, qname, 64);
+			int copy_len = len < MAX_DOMAIN_SIZE ? len : MAX_DOMAIN_SIZE;
+			custom_memcpy(domain_key, qname, copy_len);
+
+			bpf_printk("domain_key  %s copy_len is %d from %pI4", domain_key, copy_len, &ipv4->saddr);
 				
                         // Check against the domain denylist
                         if (bpf_map_lookup_elem(&domain_denylist, domain_key))
