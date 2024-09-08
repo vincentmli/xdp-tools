@@ -248,12 +248,18 @@ int xdp_dns(struct xdp_md *ctx)
 
 			int copy_len = len < MAX_DOMAIN_SIZE ? len : MAX_DOMAIN_SIZE;
 			custom_memcpy(domain_key, qname, copy_len);
+			domain_key[MAX_DOMAIN_SIZE] = '\0'; // Ensure null-termination
 
 			bpf_printk("domain_key  %s copy_len is %d from %pI4", domain_key, copy_len, &ipv4->saddr);
 				
                         // Check against the domain denylist
-                        if (bpf_map_lookup_elem(&domain_denylist, domain_key))
-                                return XDP_DROP;
+                        if (bpf_map_lookup_elem(&domain_denylist, domain_key)) {
+				bpf_printk("Domain %s found in denylist, dropping packet\n", domain_key);
+				return XDP_DROP;
+			}
+                        else {
+				bpf_printk("Domain %s not found in denylist\n", domain_key);
+			}
 
 			break;
 		}
