@@ -4,7 +4,7 @@
 #include <string.h>
 #include <errno.h>
 
-#define MAX_DOMAIN_SIZE 128
+#define MAX_DOMAIN_SIZE 18
 
 int main() {
     int map_fd;

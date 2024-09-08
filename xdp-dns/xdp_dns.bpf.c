@@ -40,7 +40,7 @@
 // do not use libc includes because this causes clang
 // to include 32bit headers on 64bit ( only ) systems.
 #define memcpy __builtin_memcpy
-#define MAX_DOMAIN_SIZE 128
+#define MAX_DOMAIN_SIZE 18
 
 struct meta_data {
 	__u16 eth_proto;
