@@ -7,6 +7,11 @@
 
 #define MAX_DOMAIN_SIZE 18  // Increased size to handle larger domains
 
+struct domain_key {
+    struct bpf_lpm_trie_key lpm_key;
+    char data[MAX_DOMAIN_SIZE + 1];
+};
+
 // Function to encode a domain name with label lengths
 static void encode_domain(const char *domain, char *encoded) {
     const char *ptr = domain;
@@ -44,7 +49,7 @@ static void reverse_string(char *str) {
 
 int main(int argc, char *argv[]) {
     int map_fd;
-    char domain_key[MAX_DOMAIN_SIZE + 1] = {0};
+    struct domain_key dkey = {0};
     __u8 value = 1;
 
     // Check for proper number of arguments
@@ -54,8 +59,11 @@ int main(int argc, char *argv[]) {
     }
 
     // Encode the domain name with label lengths
-    encode_domain(argv[1], domain_key);
-    reverse_string(domain_key);
+    encode_domain(argv[1], dkey.data);
+    reverse_string(dkey.data);
+
+  // Set the LPM trie key prefix length
+    dkey.lpm_key.prefixlen = strlen(dkey.data) * 8;
 
     // Open the BPF map
     map_fd = bpf_obj_get("/sys/fs/bpf/xdp-dns/domain_denylist");
@@ -65,7 +73,7 @@ int main(int argc, char *argv[]) {
     }
 
     // Update the map with the encoded domain name
-    if (bpf_map_update_elem(map_fd, domain_key, &value, BPF_ANY) != 0) {
+    if (bpf_map_update_elem(map_fd, &dkey, &value, BPF_ANY) != 0) {
         fprintf(stderr, "Failed to update map: %s\n", strerror(errno));
         return 1;
     }
