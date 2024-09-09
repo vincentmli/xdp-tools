@@ -191,6 +191,14 @@ static __always_inline __u8 custom_strlen(const char *str, struct cursor *c) {
     return len;
 }
 
+static __always_inline void reverse_string(char *str, __u8 len) {
+    for (int i = 0; i < (len - 1) / 2; i++) {
+        char temp = str[i];
+        str[i] = str[len - 1 - i];
+        str[len - 1 - i] = temp;
+    }
+}
+
 SEC("xdp")
 int xdp_dns(struct xdp_md *ctx)
 {
@@ -201,7 +209,7 @@ int xdp_dns(struct xdp_md *ctx)
 	struct udphdr    *udp;
 	struct dnshdr    *dns;
 	char	*qname;
-//	__u8 value = 1;
+	//__u8 value = 1;
 	__u8 len = 0;
 	char domain_key[MAX_DOMAIN_SIZE + 1 ] = {0};  // Buffer for map lookup
 
@@ -248,16 +256,15 @@ int xdp_dns(struct xdp_md *ctx)
 			int copy_len = len < MAX_DOMAIN_SIZE ? len : MAX_DOMAIN_SIZE;
 			custom_memcpy(domain_key, qname, copy_len);
 			domain_key[MAX_DOMAIN_SIZE] = '\0'; // Ensure null-termination
+			reverse_string(domain_key, copy_len);
 
-/*
 			bpf_printk("domain_key  %s copy_len is %d from %pI4", domain_key, copy_len, &ipv4->saddr);
-			
+/*
 			if (bpf_map_update_elem(&domain_denylist, &domain_key, &value, BPF_ANY) < 0) {
 				bpf_printk("Domain %s not updated in denylist\n", domain_key);
 			} else {
 				bpf_printk("Domain %s updated in denylist\n", domain_key);
 			}
-				
 */
                         if (bpf_map_lookup_elem(&domain_denylist, domain_key)) {
 				bpf_printk("Domain %s found in denylist, dropping packet\n", domain_key);
