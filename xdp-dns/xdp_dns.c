@@ -1,3 +1,20 @@
+/*
+ * Copyright (c) 2024, BPFire.  All rights reserved.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <stdio.h>
@@ -6,6 +23,11 @@
 #include <stdlib.h>
 
 #define MAX_DOMAIN_SIZE 128  // Increased size to handle larger domains
+
+struct domain_key {
+    struct bpf_lpm_trie_key lpm_key;
+    char data[MAX_DOMAIN_SIZE + 1];
+};
 
 // Function to encode a domain name with label lengths
 static void encode_domain(const char *domain, char *encoded) {
@@ -33,9 +55,18 @@ static void encode_domain(const char *domain, char *encoded) {
     *enc_ptr++ = 0;
 }
 
+static void reverse_string(char *str) {
+    int len = strlen(str);
+    for (int i = 0; i < len / 2; i++) {
+        char temp = str[i];
+        str[i] = str[len - i - 1];
+        str[len - i - 1] = temp;
+    }
+}
+
 int main(int argc, char *argv[]) {
     int map_fd;
-    char domain_key[MAX_DOMAIN_SIZE + 1] = {0};
+    struct domain_key dkey = {0};
     __u8 value = 1;
 
     // Check for proper number of arguments
@@ -45,7 +76,11 @@ int main(int argc, char *argv[]) {
     }
 
     // Encode the domain name with label lengths
-    encode_domain(argv[1], domain_key);
+    encode_domain(argv[1], dkey.data);
+    reverse_string(dkey.data);
+
+  // Set the LPM trie key prefix length
+    dkey.lpm_key.prefixlen = strlen(dkey.data) * 8;
 
     // Open the BPF map
     map_fd = bpf_obj_get("/sys/fs/bpf/xdp-dns/domain_denylist");
@@ -55,7 +90,7 @@ int main(int argc, char *argv[]) {
     }
 
     // Update the map with the encoded domain name
-    if (bpf_map_update_elem(map_fd, domain_key, &value, BPF_ANY) != 0) {
+    if (bpf_map_update_elem(map_fd, &dkey, &value, BPF_ANY) != 0) {
         fprintf(stderr, "Failed to update map: %s\n", strerror(errno));
         return 1;
     }
