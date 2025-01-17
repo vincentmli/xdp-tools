@@ -48,22 +48,6 @@ struct meta_data {
 	__u16 unused;
 };
 
-
-struct ipv4_key {
-	struct   bpf_lpm_trie_key lpm_key;
-	__u8  ipv4[4];
-};
-
-struct {
-	__uint(type,  BPF_MAP_TYPE_LPM_TRIE);
-	__type(key,   struct ipv4_key);
-	__type(value, __u64);
-	__uint(max_entries, 10000);
-	__uint(pinning, LIBBPF_PIN_BY_NAME);
-	__uint(map_flags, BPF_F_NO_PREALLOC);
-} exclude_v4_prefixes __section(".maps");
-
-
 /*
  *  Store the VLAN header
  */
@@ -225,7 +209,6 @@ int xdp_dns(struct xdp_md *ctx)
 	struct iphdr     *ipv4;
 	struct udphdr    *udp;
 	struct dnshdr    *dns;
-	__u64         *count;
 
 	if (bpf_xdp_adjust_meta(ctx, -(int)sizeof(struct meta_data)))
 		return XDP_PASS;
@@ -248,19 +231,6 @@ int xdp_dns(struct xdp_md *ctx)
 			|| !(udp->dest == __bpf_htons(DNS_PORT))
 			|| !(dns = parse_dnshdr(&c)))
 				return XDP_PASS; /* Not DNS */
-			// search for the prefix in the LPM trie
-			struct {
-				__u32 prefixlen;
-				__u32 ipv4_addr;
-			} key4 = {
-				.prefixlen = 32,
-				.ipv4_addr = ipv4->saddr
-			};
-
-			// if the prefix matches, we exclude it from rate limiting
-			if ((count=bpf_map_lookup_elem(&exclude_v4_prefixes, &key4))) {
-				return XDP_PASS;
-			}
 
 			if (dns->flags.as_bits_and_pieces.qr
 			||  dns->qdcount != __bpf_htons(1)
