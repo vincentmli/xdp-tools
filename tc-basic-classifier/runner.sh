@@ -86,7 +86,7 @@ $TC_CLASS_ADD 1:1 classid 1:30 htb rate "$START_RATE" ceil "$DEFAULT_LIMIT"
 # Setup filters
 if [ "$mode" == "bpf" ]; then
 	$TC -netns $L_NS filter add dev $L_DEV protocol ip parent 1:0 \
-			bpf obj filter.o classid 1: direct-action
+			bpf obj class_filter.bpf.o classid 1: direct-action
 else
 	U32="$TC -netns $L_NS filter add dev $L_DEV protocol ip parent 1:0 prio 1 u32"
 	$U32 match ip dport 8080 FFFF flowid 1:10

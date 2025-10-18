@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
 
-TC_TARGETS := filter.bpf
+TC_TARGETS := class_filter.bpf
 BPF_SKEL_TARGETS := $(TC_TARGETS)
 
 EXTRA_DEPS := parsing_helpers.h
