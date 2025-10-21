@@ -132,7 +132,7 @@ static int delete_tc_class(const char *iface, __u32 classid)
     return 0; /* Don't treat class deletion failure as fatal */
 }
 
-static int parse_port_mapping(const char *arg, __be16 *port, __u32 *classid, char **rate)
+static int parse_port_mapping(const char *arg, __u16 *port, __u32 *classid, char **rate)
 {
     char buf[256];
     char *sep1, *sep2;
@@ -172,7 +172,7 @@ static int parse_port_mapping(const char *arg, __be16 *port, __u32 *classid, cha
         return -ENOMEM;
     }
     
-    *port = htons(port_num);
+    *port = (__u16)port_num;  // Store in host order, not network order
     *classid = minor_num;
     return 0;
 }
@@ -235,7 +235,7 @@ static int parse_ip_mapping(const char *arg, struct in_addr *ip, __u32 *prefix_l
 
 static int add_port_mapping(const char *iface, const char *arg)
 {
-    __be16 port;
+    __u16 port;  // Changed from __be16 to __u16 for host order
     __u32 classid;
     char *rate = NULL;
     int err, map_fd;
@@ -251,7 +251,7 @@ static int add_port_mapping(const char *iface, const char *arg)
         return map_fd;
     }
     
-    /* Update the pinned map */
+    /* Update the pinned map - port is now in host order */
     err = bpf_map_update_elem(map_fd, &port, &classid, BPF_ANY);
     close(map_fd);
     
@@ -274,7 +274,7 @@ static int add_port_mapping(const char *iface, const char *arg)
         return err;
     }
     
-    printf("Added port mapping: %d -> 1:%x (rate: %s)\n", ntohs(port), classid, rate);
+    printf("Added port mapping: %d -> 1:%x (rate: %s)\n", port, classid, rate);
     free(rate);
     return 0;
 }
@@ -337,7 +337,7 @@ static int add_ip_mapping(const char *iface, const char *arg)
 
 static int delete_port_mapping(const char *iface, const char *arg)
 {
-    __be16 port = htons(atoi(arg));
+    __u16 port = (__u16)atoi(arg);  // Store in host order, not network order
     int map_fd, err;
     __u32 classid;
     
@@ -449,7 +449,7 @@ static int delete_ip_mapping(const char *iface, const char *arg)
 
 static int list_port_mappings(void)
 {
-    __be16 port, next_port = 0;
+    __u16 port, next_port = 0;  // Changed from __be16 to __u16 for host order
     __u32 classid;
     int err, map_fd;
     
@@ -479,7 +479,7 @@ static int list_port_mappings(void)
             return -errno;
         }
         
-        printf("%-5d -> 1:%-6x (0x%02x)\n", ntohs(port), classid, classid);
+        printf("%-5d -> 1:%-6x (0x%02x)\n", port, classid, classid);
         next_port = port;
     }
     
@@ -542,7 +542,10 @@ static int setup_tc_qdisc(const char *iface)
     printf("Setting up TC qdisc and classes on %s\n", iface);
     
     snprintf(cmd, sizeof(cmd), "tc qdisc del dev %s root 2>/dev/null", iface);
-    system(cmd);
+    ret = system(cmd);
+    if (ret != 0 && env.verbose) {
+        printf("Note: No existing qdisc to delete on %s (may be normal)\n", iface);
+    }
     
     snprintf(cmd, sizeof(cmd), "tc qdisc add dev %s root handle 1:0 htb default 30", iface);
     if (env.verbose) printf("Executing: %s\n", cmd);
@@ -574,10 +577,17 @@ static int setup_tc_qdisc(const char *iface)
     if (env.verbose) {
         printf("\nTC qdisc configuration:\n");
         snprintf(cmd, sizeof(cmd), "tc qdisc show dev %s", iface);
-        system(cmd);
+        ret = system(cmd);
+        if (ret != 0) {
+            printf("Failed to show qdisc configuration\n");
+        }
+        
         printf("\nTC classes configuration:\n");
         snprintf(cmd, sizeof(cmd), "tc class show dev %s", iface);
-        system(cmd);
+        ret = system(cmd);
+        if (ret != 0) {
+            printf("Failed to show class configuration\n");
+        }
     }
     
     return 0;
@@ -592,7 +602,10 @@ static int attach_bpf_with_tc(const char *iface, const char *bpf_obj_path)
     cleanup_pinned_maps();
     
     snprintf(cmd, sizeof(cmd), "tc filter del dev %s protocol ip parent 1:0 2>/dev/null", iface);
-    system(cmd);
+    ret = system(cmd);
+    if (ret != 0 && env.verbose) {
+        printf("Note: No existing filter to delete on %s (may be normal)\n", iface);
+    }
     
     snprintf(cmd, sizeof(cmd),
              "tc filter add dev %s protocol ip parent 1:0 "
@@ -619,11 +632,17 @@ static int attach_bpf_with_tc(const char *iface, const char *bpf_obj_path)
     if (env.verbose) {
         snprintf(cmd, sizeof(cmd), "tc filter show dev %s parent 1:0", iface);
         printf("Verification:\n");
-        system(cmd);
+        ret = system(cmd);
+        if (ret != 0) {
+            printf("Failed to show filter configuration\n");
+        }
         
         /* Also show the pinned maps */
         printf("Pinned maps:\n");
-        system("ls -la /sys/fs/bpf/tc/globals/ 2>/dev/null || echo 'No pinned maps found'");
+        ret = system("ls -la /sys/fs/bpf/tc/globals/ 2>/dev/null || echo 'No pinned maps found'");
+        if (ret != 0) {
+            printf("Failed to list pinned maps\n");
+        }
     }
     
     return 0;
@@ -651,8 +670,12 @@ static int detach_bpf_with_tc(const char *iface)
     
     snprintf(cmd, sizeof(cmd), "tc qdisc del dev %s root 2>/dev/null", iface);
     if (env.verbose) printf("Executing: %s\n", cmd);
-    system(cmd);
-    printf("Removed TC qdisc from %s\n", iface);
+    ret = system(cmd);
+    if (ret != 0) {
+        printf("No TC qdisc found on %s (or error removing)\n", iface);
+    } else {
+        printf("Removed TC qdisc from %s\n", iface);
+    }
     
     return 0;
 }

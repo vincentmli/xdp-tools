@@ -21,7 +21,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1024);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
-    __type(key, __be16);  /* TCP destination port */
+    __type(key, __u16);  /* TCP destination port */
     __type(value, __u32); /* Class ID */
 } cls_filter_tcp_port_map SEC(".maps");
 
@@ -98,17 +98,8 @@ int cls_filter(struct __sk_buff *skb)
     __u16 dest_port = bpf_ntohs(tcphdr->dest);
     __u32 *port_class = bpf_map_lookup_elem(&cls_filter_tcp_port_map, &dest_port);
     if (port_class) {
+ 	//bpf_printk("Port class: %u, Destination port: %u", *port_class, dest_port);
         skb->tc_classid = *port_class;
-    } else {
-        /* Fallback to original switch-based port classification */
-        switch (tcphdr->dest) {
-        case bpf_htons(8080):
-            skb->tc_classid = 0x10; /* Handles are always in hex */
-            break;
-        case bpf_htons(8081):
-            skb->tc_classid = 0x20;
-            break;
-        }
     }
 
 out:
