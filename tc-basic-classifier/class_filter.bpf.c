@@ -75,6 +75,7 @@ int cls_filter(struct __sk_buff *skb)
         __u32 *ip_class = bpf_map_lookup_elem(&cls_filter_ip_trie_map, &ip_key);
         if (ip_class) {
             skb->tc_classid = *ip_class;
+	    //bpf_printk("IP match: dest_ip=%pI4 classid=0x%x\n", &iphdr->daddr, skb->tc_classid);
             goto out; /* IP match takes precedence */
         }
         

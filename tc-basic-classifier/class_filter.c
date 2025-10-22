@@ -294,7 +294,7 @@ static int add_ip_mapping(const char *iface, const char *arg)
         __u32 ip;
     } key = {
         .prefix_len = prefix_len,
-        .ip = ntohl(ip.s_addr)
+        .ip = ip.s_addr  // Store in NETWORK order (don't use ntohl!)
     };
     
     /* Get pinned map FD created by tc */
@@ -409,7 +409,7 @@ static int delete_ip_mapping(const char *iface, const char *arg)
         __u32 ip;
     } key = {
         .prefix_len = prefix_len,
-        .ip = ntohl(ip.s_addr)
+        .ip = ip.s_addr  // Store in NETWORK order (don't use ntohl!)
     };
     
     map_fd = get_pinned_map("cls_filter_ip_trie_map");
@@ -522,7 +522,7 @@ static int list_ip_mappings(void)
             return -errno;
         }
         
-        struct in_addr ip_addr = { .s_addr = htonl(key.ip) };
+        struct in_addr ip_addr = { .s_addr = key.ip };  // ip is in network order
         char ip_str[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &ip_addr, ip_str, sizeof(ip_str));
         
