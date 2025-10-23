@@ -77,7 +77,7 @@ static int get_pinned_map(const char *map_name)
 static void cleanup_pinned_maps(void)
 {
     /* Simply delete the pinned map files from tc globals directory */
-    unlink("/sys/fs/bpf/tc/globals/cls_filter_tcp_port_map");
+    unlink("/sys/fs/bpf/tc/globals/cls_filter_port_map");
     unlink("/sys/fs/bpf/tc/globals/cls_filter_ip_trie_map");
 }
 
@@ -244,7 +244,7 @@ static int add_port_mapping(const char *iface, const char *arg)
     if (err) return err;
     
     /* Get pinned map FD created by tc */
-    map_fd = get_pinned_map("cls_filter_tcp_port_map");
+    map_fd = get_pinned_map("cls_filter_port_map");
     if (map_fd < 0) {
         fprintf(stderr, "Error: failed to get pinned map. Is BPF program attached?\n");
         free(rate);
@@ -265,7 +265,7 @@ static int add_port_mapping(const char *iface, const char *arg)
     err = add_tc_class(iface, classid, env.start_rate, rate);
     if (err) {
         /* Roll back map update on failure */
-        map_fd = get_pinned_map("cls_filter_tcp_port_map");
+        map_fd = get_pinned_map("cls_filter_port_map");
         if (map_fd >= 0) {
             bpf_map_delete_elem(map_fd, &port);
             close(map_fd);
@@ -341,7 +341,7 @@ static int delete_port_mapping(const char *iface, const char *arg)
     int map_fd, err;
     __u32 classid;
     
-    map_fd = get_pinned_map("cls_filter_tcp_port_map");
+    map_fd = get_pinned_map("cls_filter_port_map");
     if (map_fd < 0) {
         fprintf(stderr, "Error: failed to get pinned map. Is BPF program attached?\n");
         return map_fd;
@@ -453,7 +453,7 @@ static int list_port_mappings(void)
     __u32 classid;
     int err, map_fd;
     
-    map_fd = get_pinned_map("cls_filter_tcp_port_map");
+    map_fd = get_pinned_map("cls_filter_port_map");
     if (map_fd < 0) {
         fprintf(stderr, "Error: failed to get pinned map. Is BPF program attached?\n");
         return map_fd;
@@ -622,7 +622,7 @@ static int attach_bpf_with_tc(const char *iface, const char *bpf_obj_path)
     printf("Successfully attached BPF program to %s egress (parent 1:0)\n", iface);
     
     /* Verify maps were pinned by tc */
-    if (get_pinned_map("cls_filter_tcp_port_map") < 0 || 
+    if (get_pinned_map("cls_filter_port_map") < 0 ||
         get_pinned_map("cls_filter_ip_trie_map") < 0) {
         fprintf(stderr, "Warning: BPF maps were not pinned. Check LIBBPF_PIN_BY_NAME in BPF program.\n");
     } else {

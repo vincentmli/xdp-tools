@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /* Copyright 2021 Frey Alfredsson <freysteinn@freysteinn.com> */
+/* Copyright 2025 Vincent Li <vincent.mc.li@gmail.com> */
 /* Based on code by Jesper Dangaard Brouer <brouer@redhat.com> */
 
 #include <linux/bpf.h>
@@ -8,22 +9,14 @@
 #include <linux/pkt_cls.h>
 #include "parsing_helpers.h"
 
-/*
- * This example eBPF code mirrors the TC u32 rules set in the runner.sh
- * script, where the script gives different rate limits depending on if the TCP
- * traffic is for ports 8080 or 8081. It must be loaded with the direct-action
- * flag on TC to function, as this is a Qdisc classifier, not a Qdisc action. The
- * runner.sh script shows an example of how it is loaded and used.
- */
-
-/* BPF map for TCP port to class ID mapping */
+/* BPF map for TCP/UDP port to class ID mapping */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1024);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
-    __type(key, __u16);  /* TCP destination port */
+    __type(key, __u16);  /* TCP/UDP destination port in host order */
     __type(value, __u32); /* Class ID */
-} cls_filter_tcp_port_map SEC(".maps");
+} cls_filter_port_map SEC(".maps");
 
 /* BPF trie map for destination IP range lookup */
 struct {
@@ -51,19 +44,25 @@ int cls_filter(struct __sk_buff *skb)
     struct ethhdr *eth;
     int eth_type;
     int ip_type;
-    int tcp_type;
-    struct iphdr *iphdr;
-    struct ipv6hdr *ipv6hdr;
+    int tcp_type, udp_type;
+    struct iphdr *iphdr = NULL;
+    struct ipv6hdr *ipv6hdr = NULL;
     struct tcphdr *tcphdr;
+    struct udphdr *udphdr;
+    __u16 dest_port = 0;
+
     skb->tc_classid = 0x30; /* Default class */
 
     nh.pos = data;
 
     /* Parse Ethernet and IP/IPv6 headers */
     eth_type = parse_ethhdr(&nh, data_end, &eth);
+    if (eth_type < 0)
+        goto out;
+
     if (eth_type == bpf_htons(ETH_P_IP)) {
         ip_type = parse_iphdr(&nh, data_end, &iphdr);
-        if (ip_type != IPPROTO_TCP)
+        if (ip_type < 0 || !iphdr || (void *)(iphdr + 1) > data_end)
             goto out;
         
         /* Look up destination IP in trie map */
@@ -75,32 +74,47 @@ int cls_filter(struct __sk_buff *skb)
         __u32 *ip_class = bpf_map_lookup_elem(&cls_filter_ip_trie_map, &ip_key);
         if (ip_class) {
             skb->tc_classid = *ip_class;
-	    //bpf_printk("IP match: dest_ip=%pI4 classid=0x%x\n", &iphdr->daddr, skb->tc_classid);
+	    bpf_printk("IP match: dest_ip=%pI4 classid=0x%x\n",
+                      &iphdr->daddr, skb->tc_classid);
             goto out; /* IP match takes precedence */
         }
         
+        /* Parse transport layer for port-based classification */
+        if (ip_type == IPPROTO_TCP) {
+            tcp_type = parse_tcphdr(&nh, data_end, &tcphdr);
+            if (tcp_type >= 0 && tcphdr && (void *)(tcphdr + 1) <= data_end)
+                dest_port = bpf_ntohs(tcphdr->dest);
+        } else if (ip_type == IPPROTO_UDP) {
+            udp_type = parse_udphdr(&nh, data_end, &udphdr);
+            if (udp_type >= 0 && udphdr && (void *)(udphdr + 1) <= data_end)
+                dest_port = bpf_ntohs(udphdr->dest);
+        }
+
     } else if (eth_type == bpf_htons(ETH_P_IPV6)) {
         ip_type = parse_ip6hdr(&nh, data_end, &ipv6hdr);
-        if (ip_type != IPPROTO_TCP)
+        if (ip_type < 0 || !ipv6hdr || (void *)(ipv6hdr + 1) > data_end)
             goto out;
-        /* IPv6 trie lookup could be added here similarly */
+        /* Parse transport layer for port-based classification */
+        if (ip_type == IPPROTO_TCP) {
+            tcp_type = parse_tcphdr(&nh, data_end, &tcphdr);
+            if (tcp_type >= 0 && tcphdr && (void *)(tcphdr + 1) <= data_end)
+                dest_port = bpf_ntohs(tcphdr->dest);
+        } else if (ip_type == IPPROTO_UDP) {
+            udp_type = parse_udphdr(&nh, data_end, &udphdr);
+            if (udp_type >= 0 && udphdr && (void *)(udphdr + 1) <= data_end)
+                dest_port = bpf_ntohs(udphdr->dest);
+        }
     } else {
         goto out;
     }
 
-    /* Parse TCP header and look up port in map */
-    tcp_type = parse_tcphdr(&nh, data_end, &tcphdr);
-    if (tcp_type < 0) goto out;
-    if (tcphdr + 1 > data_end) {
-        goto out;
-    }
-
-    /* Look up TCP destination port in hash map */
-    __u16 dest_port = bpf_ntohs(tcphdr->dest);
-    __u32 *port_class = bpf_map_lookup_elem(&cls_filter_tcp_port_map, &dest_port);
-    if (port_class) {
- 	//bpf_printk("Port class: %u, Destination port: %u", *port_class, dest_port);
-        skb->tc_classid = *port_class;
+    /* Look up destination port in hash map for both TCP and UDP */
+    if (dest_port > 0) {
+        __u32 *port_class = bpf_map_lookup_elem(&cls_filter_port_map, &dest_port);
+        if (port_class) {
+            skb->tc_classid = *port_class;
+            bpf_printk("Port match: dest_port=%d classid=0x%x\n", dest_port, skb->tc_classid);
+        }
     }
 
 out:
