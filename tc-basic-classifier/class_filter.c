@@ -9,6 +9,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <stdbool.h>
+#include <sys/wait.h>
 
 static struct env {
     bool verbose;
@@ -23,7 +25,7 @@ static const struct option long_options[] = {
     { "interface", required_argument, NULL, 'i' },
     { "bpf-object", required_argument, NULL, 'b' },
     { "verbose", no_argument, NULL, 'v' },
-    { "add-port", required_argument, NULL, 'p' },
+    { "add-port", required_argument, NULL, 'p' },  // Combined: single port or range
     { "add-ip", required_argument, NULL, 'r' },
     { "delete-port", required_argument, NULL, 'd' },
     { "delete-ip", required_argument, NULL, 'x' },
@@ -44,22 +46,22 @@ static void print_usage(void)
     printf("Usage: class_filter [OPTIONS]...\n");
     printf("\n");
     printf("OPTIONS:\n");
-    printf("  -i, --interface <iface>    Network interface to attach to\n");
-    printf("  -b, --bpf-object <path>    Path to BPF object file (default: class_filter.bpf.o)\n");
-    printf("  -v, --verbose              Verbose output\n");
-    printf("  -p, --add-port <port:class:rate> Add TCP port mapping with rate (e.g., 8080:10:50mbit)\n");
-    printf("  -r, --add-ip <cidr:class:rate>  Add IP range mapping with rate (e.g., 192.168.1.0/24:40:30mbit)\n");
-    printf("  -d, --delete-port <port>   Delete TCP port mapping\n");
-    printf("  -x, --delete-ip <cidr>     Delete IP range mapping\n");
-    printf("  -l, --list-ports           List all TCP port mappings\n");
-    printf("  -m, --list-ips             List all IP range mappings\n");
-    printf("  -a, --attach               Attach BPF program to interface\n");
-    printf("  -D, --detach               Detach BPF program from interface\n");
-    printf("  -s, --setup-qdisc          Setup TC qdisc and classes\n");
-    printf("  -L, --limit <rate>         Overall limit rate (default: 100mbit)\n");
-    printf("  -S, --start-rate <rate>    Start rate for classes (default: 5mbit)\n");
-    printf("  -3, --default-limit <rate> Default class ceil limit (default: 20mbit)\n");
-    printf("  -h, --help                 Show this help message\n");
+    printf("  -i, --interface <iface>        Network interface to attach to\n");
+    printf("  -b, --bpf-object <path>        Path to BPF object file (default: class_filter.bpf.o)\n");
+    printf("  -v, --verbose                  Verbose output\n");
+    printf("  -p, --add-port <spec:class:rate>       Add port mapping (e.g., 80:10:50mbit or 8000-8080:20:30mbit)\n");
+    printf("  -r, --add-ip <cidr:class:rate>       Add IP range mapping with rate (e.g., 192.168.1.0/24:40:30mbit)\n");
+    printf("  -d, --delete-port <port>              Delete port mapping\n");
+    printf("  -x, --delete-ip <cidr>         Delete IP range mapping\n");
+    printf("  -l, --list-ports               List all port mappings\n");
+    printf("  -m, --list-ips                 List all IP range mappings\n");
+    printf("  -a, --attach                   Attach BPF program to interface\n");
+    printf("  -D, --detach                   Detach BPF program from interface\n");
+    printf("  -s, --setup-qdisc              Setup TC qdisc and classes\n");
+    printf("  -L, --limit <rate>             Overall limit rate (default: 100mbit)\n");
+    printf("  -S, --start-rate <rate>        Start rate for classes (default: 5mbit)\n");
+    printf("  -3, --default-limit <rate>     Default class ceil limit (default: 20mbit)\n");
+    printf("  -h, --help                     Show this help message\n");
 }
 
 /* Get map FD from pinned path */
@@ -76,28 +78,55 @@ static int get_pinned_map(const char *map_name)
 
 static void cleanup_pinned_maps(void)
 {
-    /* Simply delete the pinned map files from tc globals directory */
     unlink("/sys/fs/bpf/tc/globals/cls_filter_port_map");
     unlink("/sys/fs/bpf/tc/globals/cls_filter_ip_trie_map");
+}
+
+/* Helper function to execute system commands with proper error checking */
+static int execute_system_cmd(const char *cmd, bool ignore_failure)
+{
+    if (env.verbose) {
+        printf("Executing: %s\n", cmd);
+    }
+    
+    int ret = system(cmd);
+    if (ret == -1) {
+        fprintf(stderr, "Error: system() failed for command: %s\n", cmd);
+        return -EINVAL;
+    }
+    
+    if (WIFEXITED(ret)) {
+        int exit_status = WEXITSTATUS(ret);
+        if (exit_status != 0) {
+            if (!ignore_failure) {
+                fprintf(stderr, "Error: command failed with exit code %d: %s\n", exit_status, cmd);
+                return -EINVAL;
+            } else if (env.verbose) {
+                printf("Command failed but ignoring (may be normal): %s\n", cmd);
+            }
+        }
+    } else {
+        fprintf(stderr, "Error: command terminated abnormally: %s\n", cmd);
+        return -EINVAL;
+    }
+    
+    return 0;
 }
 
 static int add_tc_class(const char *iface, __u32 classid, const char *rate, const char *ceil)
 {
     char cmd[512];
-    int ret;
-    
     char class_str[16];
-    snprintf(class_str, sizeof(class_str), "1:%x", classid);
     
+    snprintf(class_str, sizeof(class_str), "1:%x", classid);
     snprintf(cmd, sizeof(cmd),
              "tc class add dev %s parent 1:1 classid %s htb rate %s ceil %s",
              iface, class_str, rate, ceil);
     
-    if (env.verbose) printf("Executing: %s\n", cmd);
-    ret = system(cmd);
-    if (ret != 0) {
+    int err = execute_system_cmd(cmd, false);
+    if (err) {
         fprintf(stderr, "Error: failed to add TC class %s\n", class_str);
-        return -EINVAL;
+        return err;
     }
     
     printf("Added TC class: %s (rate: %s, ceil: %s)\n", class_str, rate, ceil);
@@ -107,72 +136,94 @@ static int add_tc_class(const char *iface, __u32 classid, const char *rate, cons
 static int delete_tc_class(const char *iface, __u32 classid)
 {
     char cmd[512];
-    int ret;
-    
     char class_str[16];
-    snprintf(class_str, sizeof(class_str), "1:%x", classid);
     
-    /* Delete the TC class */
+    snprintf(class_str, sizeof(class_str), "1:%x", classid);
     snprintf(cmd, sizeof(cmd),
              "tc class del dev %s classid %s 2>/dev/null",
              iface, class_str);
     
-    if (env.verbose) printf("Executing: %s\n", cmd);
-    ret = system(cmd);
+    /* Ignore failure for deletion - it's OK if class doesn't exist */
+    execute_system_cmd(cmd, true);
     
-    if (ret != 0) {
-        /* It's not an error if the class doesn't exist */
-        if (env.verbose) {
-            printf("TC class %s doesn't exist or error removing (may be normal)\n", class_str);
-        }
-    } else {
-        printf("Deleted TC class: %s\n", class_str);
+    if (env.verbose) {
+        printf("Attempted to delete TC class: %s\n", class_str);
     }
     
-    return 0; /* Don't treat class deletion failure as fatal */
+    return 0;
 }
 
-static int parse_port_mapping(const char *arg, __u16 *port, __u32 *classid, char **rate)
+/* Unified port mapping parser - detects single port vs range automatically */
+static int parse_unified_port_mapping(const char *arg, __u16 *start_port, __u16 *end_port, 
+                                     __u32 *classid, char **rate)
 {
     char buf[256];
-    char *sep1, *sep2;
+    char *first_colon, *second_colon, *dash;
     
     strncpy(buf, arg, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
     
-    sep1 = strchr(buf, ':');
-    if (!sep1) {
-        fprintf(stderr, "Error: port mapping must be in format 'port:class:rate'\n");
+    /* Find the colons separating port(s):class:rate */
+    first_colon = strchr(buf, ':');
+    if (!first_colon) {
+        fprintf(stderr, "Error: port mapping must be in format 'port:class:rate' or 'start-end:class:rate'\n");
         return -EINVAL;
     }
-    *sep1 = '\0';
+    *first_colon = '\0';
     
-    sep2 = strchr(sep1 + 1, ':');
-    if (!sep2) {
-        fprintf(stderr, "Error: port mapping must be in format 'port:class:rate'\n");
+    second_colon = strchr(first_colon + 1, ':');
+    if (!second_colon) {
+        fprintf(stderr, "Error: port mapping must be in format 'port:class:rate' or 'start-end:class:rate'\n");
         return -EINVAL;
     }
-    *sep2 = '\0';
+    *second_colon = '\0';
     
-    long port_num = strtol(buf, NULL, 10);
-    if (port_num <= 0 || port_num > 65535) {
-        fprintf(stderr, "Error: port must be between 1 and 65535\n");
-        return -EINVAL;
+    /* Check if it's a range (contains dash) or single port */
+    dash = strchr(buf, '-');
+    if (dash) {
+        /* It's a port range: start-end:class:rate */
+        *dash = '\0';
+        
+        long start = strtol(buf, NULL, 10);
+        long end = strtol(dash + 1, NULL, 10);
+        
+        if (start <= 0 || start > 65535 || end <= 0 || end > 65535 || start > end) {
+            fprintf(stderr, "Error: port range must be between 1-65535 and start <= end\n");
+            return -EINVAL;
+        }
+        
+        /* Limit range size to prevent excessive map entries */
+        if ((end - start + 1) > 1000) {
+            fprintf(stderr, "Error: port range too large (max 1000 ports). Use smaller ranges.\n");
+            return -EINVAL;
+        }
+        
+        *start_port = (__u16)start;
+        *end_port = (__u16)end;
+    } else {
+        /* It's a single port: port:class:rate */
+        long port = strtol(buf, NULL, 10);
+        if (port <= 0 || port > 65535) {
+            fprintf(stderr, "Error: port must be between 1 and 65535\n");
+            return -EINVAL;
+        }
+        *start_port = (__u16)port;
+        *end_port = (__u16)port;
     }
     
-    long minor_num = strtol(sep1 + 1, NULL, 16);
+    /* Parse class ID and rate (common for both single port and range) */
+    long minor_num = strtol(first_colon + 1, NULL, 16);
     if (minor_num <= 0 || minor_num > 0xFFFF) {
         fprintf(stderr, "Error: class minor must be between 1 and 0xFFFF\n");
         return -EINVAL;
     }
     
-    *rate = strdup(sep2 + 1);
+    *rate = strdup(second_colon + 1);
     if (!*rate) {
         fprintf(stderr, "Error: failed to allocate memory for rate\n");
         return -ENOMEM;
     }
     
-    *port = (__u16)port_num;  // Store in host order, not network order
     *classid = minor_num;
     return 0;
 }
@@ -233,17 +284,19 @@ static int parse_ip_mapping(const char *arg, struct in_addr *ip, __u32 *prefix_l
     return 0;
 }
 
+/* Unified port mapping function - handles both single ports and ranges */
 static int add_port_mapping(const char *iface, const char *arg)
 {
-    __u16 port;  // Changed from __be16 to __u16 for host order
+    __u16 start_port, end_port;
     __u32 classid;
     char *rate = NULL;
     int err, map_fd;
     
-    err = parse_port_mapping(arg, &port, &classid, &rate);
-    if (err) return err;
+    err = parse_unified_port_mapping(arg, &start_port, &end_port, &classid, &rate);
+    if (err) {
+        return err;
+    }
     
-    /* Get pinned map FD created by tc */
     map_fd = get_pinned_map("cls_filter_port_map");
     if (map_fd < 0) {
         fprintf(stderr, "Error: failed to get pinned map. Is BPF program attached?\n");
@@ -251,30 +304,60 @@ static int add_port_mapping(const char *iface, const char *arg)
         return map_fd;
     }
     
-    /* Update the pinned map - port is now in host order */
-    err = bpf_map_update_elem(map_fd, &port, &classid, BPF_ANY);
+    bool is_single_port = (start_port == end_port);
+    int ports_added = 0;
+    int ports_failed = 0;
+    
+    /* Add port(s) to the map */
+    for (__u16 port = start_port; port <= end_port; port++) {
+        err = bpf_map_update_elem(map_fd, &port, &classid, BPF_ANY);
+        if (err) {
+            if (errno == E2BIG) {
+                fprintf(stderr, "Error: port map full (max 4096 entries). Added %d/%d ports.\n",
+                       ports_added, end_port - start_port + 1);
+                break;
+            }
+            ports_failed++;
+        } else {
+            ports_added++;
+        }
+    }
     close(map_fd);
     
-    if (err) {
-        fprintf(stderr, "Error: failed to update port map: %s\n", strerror(errno));
+    if (ports_added == 0) {
+        fprintf(stderr, "Error: failed to add any ports from specification '%s'\n", arg);
         free(rate);
-        return err;
+        return -EINVAL;
+    }
+    
+    if (ports_failed > 0) {
+        fprintf(stderr, "Warning: failed to add %d ports from specification '%s'\n",
+               ports_failed, arg);
     }
     
     /* Add TC class */
     err = add_tc_class(iface, classid, env.start_rate, rate);
     if (err) {
-        /* Roll back map update on failure */
+        /* Rollback: remove all added ports */
         map_fd = get_pinned_map("cls_filter_port_map");
         if (map_fd >= 0) {
-            bpf_map_delete_elem(map_fd, &port);
+            for (__u16 port = start_port; port <= end_port; port++) {
+                bpf_map_delete_elem(map_fd, &port);
+            }
             close(map_fd);
         }
         free(rate);
         return err;
     }
     
-    printf("Added port mapping: %d -> 1:%x (rate: %s)\n", port, classid, rate);
+    /* Print appropriate success message */
+    if (is_single_port) {
+        printf("Added port mapping: %d -> 1:%x (rate: %s)\n", start_port, classid, rate);
+    } else {
+        printf("Added %d individual ports: %d-%d -> 1:%x (rate: %s)\n",
+               ports_added, start_port, end_port, classid, rate);
+    }
+    
     free(rate);
     return 0;
 }
@@ -294,10 +377,9 @@ static int add_ip_mapping(const char *iface, const char *arg)
         __u32 ip;
     } key = {
         .prefix_len = prefix_len,
-        .ip = ip.s_addr  // Store in NETWORK order (don't use ntohl!)
+        .ip = ip.s_addr
     };
     
-    /* Get pinned map FD created by tc */
     map_fd = get_pinned_map("cls_filter_ip_trie_map");
     if (map_fd < 0) {
         fprintf(stderr, "Error: failed to get pinned map. Is BPF program attached?\n");
@@ -305,7 +387,6 @@ static int add_ip_mapping(const char *iface, const char *arg)
         return map_fd;
     }
     
-    /* Update the pinned map */
     err = bpf_map_update_elem(map_fd, &key, &classid, BPF_ANY);
     close(map_fd);
     
@@ -315,10 +396,8 @@ static int add_ip_mapping(const char *iface, const char *arg)
         return err;
     }
     
-    /* Add TC class */
     err = add_tc_class(iface, classid, env.start_rate, rate);
     if (err) {
-        /* Roll back map update on failure */
         map_fd = get_pinned_map("cls_filter_ip_trie_map");
         if (map_fd >= 0) {
             bpf_map_delete_elem(map_fd, &key);
@@ -337,7 +416,7 @@ static int add_ip_mapping(const char *iface, const char *arg)
 
 static int delete_port_mapping(const char *iface, const char *arg)
 {
-    __u16 port = (__u16)atoi(arg);  // Store in host order, not network order
+    __u16 port = (__u16)atoi(arg);
     int map_fd, err;
     __u32 classid;
     
@@ -347,17 +426,15 @@ static int delete_port_mapping(const char *iface, const char *arg)
         return map_fd;
     }
     
-    /* First, look up the classid so we can delete the TC class */
     err = bpf_map_lookup_elem(map_fd, &port, &classid);
     if (err) {
         if (env.verbose) {
             printf("Port %s not found in map, may already be deleted\n", arg);
         }
         close(map_fd);
-        return 0; /* Not an error if it doesn't exist */
+        return 0;
     }
     
-    /* Delete from BPF map */
     err = bpf_map_delete_elem(map_fd, &port);
     close(map_fd);
     
@@ -367,10 +444,7 @@ static int delete_port_mapping(const char *iface, const char *arg)
     }
     
     printf("Deleted port mapping: %s -> 1:%x\n", arg, classid);
-    
-    /* Also delete the corresponding TC class */
     delete_tc_class(iface, classid);
-    
     return 0;
 }
 
@@ -409,7 +483,7 @@ static int delete_ip_mapping(const char *iface, const char *arg)
         __u32 ip;
     } key = {
         .prefix_len = prefix_len,
-        .ip = ip.s_addr  // Store in NETWORK order (don't use ntohl!)
+        .ip = ip.s_addr
     };
     
     map_fd = get_pinned_map("cls_filter_ip_trie_map");
@@ -418,17 +492,15 @@ static int delete_ip_mapping(const char *iface, const char *arg)
         return map_fd;
     }
     
-    /* First, look up the classid so we can delete the TC class */
     err = bpf_map_lookup_elem(map_fd, &key, &classid);
     if (err) {
         if (env.verbose) {
             printf("IP mapping %s not found in map, may already be deleted\n", arg);
         }
         close(map_fd);
-        return 0; /* Not an error if it doesn't exist */
+        return 0;
     }
     
-    /* Delete from BPF map */
     err = bpf_map_delete_elem(map_fd, &key);
     close(map_fd);
     
@@ -440,16 +512,13 @@ static int delete_ip_mapping(const char *iface, const char *arg)
     char ip_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &ip, ip_str, sizeof(ip_str));
     printf("Deleted IP mapping: %s/%u -> 1:%x\n", ip_str, prefix_len, classid);
-    
-    /* Also delete the corresponding TC class */
     delete_tc_class(iface, classid);
-    
     return 0;
 }
 
 static int list_port_mappings(void)
 {
-    __u16 port, next_port = 0;  // Changed from __be16 to __u16 for host order
+    __u16 port, next_port = 0;
     __u32 classid;
     int err, map_fd;
     
@@ -459,10 +528,11 @@ static int list_port_mappings(void)
         return map_fd;
     }
     
-    printf("TCP Port Mappings:\n");
-    printf("PORT  -> TC_CLASS  (BPF_VALUE)\n");
-    printf("------------------------------\n");
+    printf("Port Mappings:\n");
+    printf("PORT    -> TC_CLASS  (BPF_VALUE)\n");
+    printf("-------------------------------\n");
     
+    int count = 0;
     while (true) {
         err = bpf_map_get_next_key(map_fd, &next_port, &port);
         if (err) {
@@ -479,11 +549,13 @@ static int list_port_mappings(void)
             return -errno;
         }
         
-        printf("%-5d -> 1:%-6x (0x%02x)\n", port, classid, classid);
+        printf("%-6d -> 1:%-6x (0x%02x)\n", port, classid, classid);
+        count++;
         next_port = port;
     }
     
     close(map_fd);
+    printf("Total: %d port mappings\n", count);
     return 0;
 }
 
@@ -506,6 +578,7 @@ static int list_ip_mappings(void)
     printf("CIDR            -> TC_CLASS  (BPF_VALUE)\n");
     printf("----------------------------------------\n");
     
+    int count = 0;
     while (true) {
         err = bpf_map_get_next_key(map_fd, &next_key, &key);
         if (err) {
@@ -522,54 +595,57 @@ static int list_ip_mappings(void)
             return -errno;
         }
         
-        struct in_addr ip_addr = { .s_addr = key.ip };  // ip is in network order
+        struct in_addr ip_addr = { .s_addr = key.ip };
         char ip_str[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &ip_addr, ip_str, sizeof(ip_str));
         
         printf("%s/%-2u -> 1:%-6x (0x%02x)\n", ip_str, key.prefix_len, classid, classid);
+        count++;
         next_key = key;
     }
     
     close(map_fd);
+    printf("Total: %d IP range mappings\n", count);
     return 0;
 }
 
 static int setup_tc_qdisc(const char *iface)
 {
     char cmd[512];
-    int ret;
+    int err;
     
     printf("Setting up TC qdisc and classes on %s\n", iface);
     
+    /* Delete existing qdisc - ignore failures */
     snprintf(cmd, sizeof(cmd), "tc qdisc del dev %s root 2>/dev/null", iface);
-    ret = system(cmd);
-    if (ret != 0 && env.verbose) {
+    err = execute_system_cmd(cmd, true);
+    if (err && env.verbose) {
         printf("Note: No existing qdisc to delete on %s (may be normal)\n", iface);
     }
     
+    /* Add root qdisc */
     snprintf(cmd, sizeof(cmd), "tc qdisc add dev %s root handle 1:0 htb default 30", iface);
-    if (env.verbose) printf("Executing: %s\n", cmd);
-    ret = system(cmd);
-    if (ret != 0) {
+    err = execute_system_cmd(cmd, false);
+    if (err) {
         fprintf(stderr, "Error: failed to add root qdisc\n");
-        return -EINVAL;
+        return err;
     }
     
+    /* Add main class */
     snprintf(cmd, sizeof(cmd), "tc class add dev %s parent 1:0 classid 1:1 htb rate %s", iface, env.limit);
-    if (env.verbose) printf("Executing: %s\n", cmd);
-    ret = system(cmd);
-    if (ret != 0) {
+    err = execute_system_cmd(cmd, false);
+    if (err) {
         fprintf(stderr, "Error: failed to add main class\n");
-        return -EINVAL;
+        return err;
     }
     
+    /* Add default class */
     snprintf(cmd, sizeof(cmd), "tc class add dev %s parent 1:1 classid 1:30 htb rate %s ceil %s", 
              iface, env.start_rate, env.default_limit);
-    if (env.verbose) printf("Executing: %s\n", cmd);
-    ret = system(cmd);
-    if (ret != 0) {
+    err = execute_system_cmd(cmd, false);
+    if (err) {
         fprintf(stderr, "Error: failed to add default class 1:30\n");
-        return -EINVAL;
+        return err;
     }
     
     printf("Successfully setup TC qdisc and classes on %s\n", iface);
@@ -577,17 +653,11 @@ static int setup_tc_qdisc(const char *iface)
     if (env.verbose) {
         printf("\nTC qdisc configuration:\n");
         snprintf(cmd, sizeof(cmd), "tc qdisc show dev %s", iface);
-        ret = system(cmd);
-        if (ret != 0) {
-            printf("Failed to show qdisc configuration\n");
-        }
+        execute_system_cmd(cmd, true);
         
         printf("\nTC classes configuration:\n");
         snprintf(cmd, sizeof(cmd), "tc class show dev %s", iface);
-        ret = system(cmd);
-        if (ret != 0) {
-            printf("Failed to show class configuration\n");
-        }
+        execute_system_cmd(cmd, true);
     }
     
     return 0;
@@ -596,32 +666,31 @@ static int setup_tc_qdisc(const char *iface)
 static int attach_bpf_with_tc(const char *iface, const char *bpf_obj_path)
 {
     char cmd[512];
-    int ret;
+    int err;
     
-    /* Clean up any existing pinned maps first */
     cleanup_pinned_maps();
     
+    /* Delete existing filter - ignore failures */
     snprintf(cmd, sizeof(cmd), "tc filter del dev %s protocol ip parent 1:0 2>/dev/null", iface);
-    ret = system(cmd);
-    if (ret != 0 && env.verbose) {
+    err = execute_system_cmd(cmd, true);
+    if (err && env.verbose) {
         printf("Note: No existing filter to delete on %s (may be normal)\n", iface);
     }
     
+    /* Attach BPF program */
     snprintf(cmd, sizeof(cmd),
              "tc filter add dev %s protocol ip parent 1:0 "
              "bpf obj %s classid 1: direct-action",
              iface, bpf_obj_path);
     
-    if (env.verbose) printf("Executing: %s\n", cmd);
-    ret = system(cmd);
-    if (ret != 0) {
+    err = execute_system_cmd(cmd, false);
+    if (err) {
         fprintf(stderr, "Error: failed to attach BPF program via tc command\n");
-        return -EINVAL;
+        return err;
     }
     
     printf("Successfully attached BPF program to %s egress (parent 1:0)\n", iface);
     
-    /* Verify maps were pinned by tc */
     if (get_pinned_map("cls_filter_port_map") < 0 ||
         get_pinned_map("cls_filter_ip_trie_map") < 0) {
         fprintf(stderr, "Warning: BPF maps were not pinned. Check LIBBPF_PIN_BY_NAME in BPF program.\n");
@@ -632,17 +701,10 @@ static int attach_bpf_with_tc(const char *iface, const char *bpf_obj_path)
     if (env.verbose) {
         snprintf(cmd, sizeof(cmd), "tc filter show dev %s parent 1:0", iface);
         printf("Verification:\n");
-        ret = system(cmd);
-        if (ret != 0) {
-            printf("Failed to show filter configuration\n");
-        }
+        execute_system_cmd(cmd, true);
         
-        /* Also show the pinned maps */
         printf("Pinned maps:\n");
-        ret = system("ls -la /sys/fs/bpf/tc/globals/ 2>/dev/null || echo 'No pinned maps found'");
-        if (ret != 0) {
-            printf("Failed to list pinned maps\n");
-        }
+        execute_system_cmd("ls -la /sys/fs/bpf/tc/globals/ 2>/dev/null || echo 'No pinned maps found'", true);
     }
     
     return 0;
@@ -651,27 +713,26 @@ static int attach_bpf_with_tc(const char *iface, const char *bpf_obj_path)
 static int detach_bpf_with_tc(const char *iface)
 {
     char cmd[256];
-    int ret;
+    int err;
     
     printf("Cleaning up TC configuration on %s\n", iface);
     
+    /* Delete filter - ignore failures */
     snprintf(cmd, sizeof(cmd), "tc filter del dev %s protocol ip parent 1:0 2>/dev/null", iface);
-    if (env.verbose) printf("Executing: %s\n", cmd);
-    ret = system(cmd);
-    if (ret != 0) {
+    err = execute_system_cmd(cmd, true);
+    if (err) {
         printf("No BPF filter found on %s parent 1:0 (or error removing)\n", iface);
     } else {
         printf("Successfully detached BPF program from %s egress\n", iface);
     }
     
-    /* Clean up pinned maps */
     cleanup_pinned_maps();
     printf("Cleaned up pinned BPF maps from /sys/fs/bpf/tc/globals/\n");
     
+    /* Delete qdisc - ignore failures */
     snprintf(cmd, sizeof(cmd), "tc qdisc del dev %s root 2>/dev/null", iface);
-    if (env.verbose) printf("Executing: %s\n", cmd);
-    ret = system(cmd);
-    if (ret != 0) {
+    err = execute_system_cmd(cmd, true);
+    if (err) {
         printf("No TC qdisc found on %s (or error removing)\n", iface);
     } else {
         printf("Removed TC qdisc from %s\n", iface);
@@ -761,7 +822,6 @@ int main(int argc, char **argv)
             if (err) return err < 0 ? -err : err;
         }
     } else if (attach && env.iface) {
-        /* Just use tc command - no libbpf skeleton needed! */
         printf("Setting up TC qdisc and classes...\n");
         err = setup_tc_qdisc(env.iface);
         if (err) return err;
@@ -771,7 +831,7 @@ int main(int argc, char **argv)
         
         printf("\nBPF program loaded and attached successfully to %s egress\n", env.iface);
         printf("Default class configured: 1:30 (rate: %s, ceil: %s)\n", env.start_rate, env.default_limit);
-        printf("\nUse --add-port and --add-ip to create additional classes with rates.\n");
+        printf("\nUse --add-port to create additional classes with rates (supports single ports and ranges).\n");
     } else {
         fprintf(stderr, "Error: must specify interface with attach/detach or map operation\n");
         print_usage();
