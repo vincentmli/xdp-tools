@@ -64,14 +64,28 @@ int cls_filter(struct __sk_buff *skb)
         ip_type = parse_iphdr(&nh, data_end, &iphdr);
         if (ip_type < 0 || !iphdr || (void *)(iphdr + 1) > data_end)
             goto out;
+
+	/* Try source IP first */
+        struct ip_key src_ip_key = {
+            .prefix_len = 32, /* Full IP address match by default */
+            .ip = iphdr->saddr
+        };
+
+        __u32 *ip_class = bpf_map_lookup_elem(&cls_filter_ip_trie_map, &src_ip_key);
+        if (ip_class) {
+            skb->tc_classid = *ip_class;
+            bpf_printk("Source IP match: src_ip=%pI4 classid=0x%x\n",
+                      &iphdr->saddr, skb->tc_classid);
+            goto out; /* Source IP match takes precedence */
+        }
         
         /* Look up destination IP in trie map */
-        struct ip_key ip_key = {
+        struct ip_key dst_ip_key = {
             .prefix_len = 32, /* Full IP address match by default */
             .ip = iphdr->daddr
         };
         
-        __u32 *ip_class = bpf_map_lookup_elem(&cls_filter_ip_trie_map, &ip_key);
+        ip_class = bpf_map_lookup_elem(&cls_filter_ip_trie_map, &dst_ip_key);
         if (ip_class) {
             skb->tc_classid = *ip_class;
 	    bpf_printk("IP match: dest_ip=%pI4 classid=0x%x\n",
