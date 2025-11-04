@@ -34,6 +34,7 @@ static const struct option long_options[] = {
     { "attach", no_argument, NULL, 'a' },
     { "detach", no_argument, NULL, 'D' },
     { "setup-qdisc", no_argument, NULL, 's' },
+    { "setup-ifb", no_argument, NULL, 'I' },  // New option for IFB setup
     { "limit", required_argument, NULL, 'L' },
     { "start-rate", required_argument, NULL, 'S' },
     { "default-limit", required_argument, NULL, '3' },
@@ -58,6 +59,7 @@ static void print_usage(void)
     printf("  -a, --attach                   Attach BPF program to interface\n");
     printf("  -D, --detach                   Detach BPF program from interface\n");
     printf("  -s, --setup-qdisc              Setup TC qdisc and classes\n");
+    printf("  -I, --setup-ifb                Setup IFB mirroring for ingress shaping (implies attaching to ifb0)\n");
     printf("  -L, --limit <rate>             Overall limit rate (default: 100mbit)\n");
     printf("  -S, --start-rate <rate>        Start rate for classes (default: 5mbit)\n");
     printf("  -3, --default-limit <rate>     Default class ceil limit (default: 20mbit)\n");
@@ -108,6 +110,238 @@ static int execute_system_cmd(const char *cmd, bool ignore_failure)
     } else {
         fprintf(stderr, "Error: command terminated abnormally: %s\n", cmd);
         return -EINVAL;
+    }
+    
+    return 0;
+}
+
+/* New function: Load kernel modules required for IFB mirroring */
+static int load_kernel_modules(void)
+{
+    const char *modules[] = {
+        "ifb numifbs=1",
+        "sch_fq_codel", 
+        "act_mirred",
+        "act_connmark",
+        NULL
+    };
+    
+    printf("Loading required kernel modules...\n");
+    
+    for (int i = 0; modules[i] != NULL; i++) {
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "modprobe %s", modules[i]);
+        
+        int err = execute_system_cmd(cmd, false);
+        if (err) {
+            fprintf(stderr, "Error: failed to load module %s\n", modules[i]);
+            return err;
+        }
+        
+        if (env.verbose) {
+            printf("Loaded module: %s\n", modules[i]);
+        }
+    }
+    
+    printf("Successfully loaded all required kernel modules\n");
+    return 0;
+}
+
+/* New function: Setup IFB device and ingress mirroring */
+static int setup_ifb_mirroring(const char *iface)
+{
+    int err;
+    
+    printf("Setting up IFB mirroring for ingress traffic shaping on %s\n", iface);
+    
+    /* Load required kernel modules */
+    err = load_kernel_modules();
+    if (err) {
+        return err;
+    }
+    
+    /* Bring up ifb0 interface */
+    const char *ifb_cmds[] = {
+        "ip link set dev ifb0 up",
+        NULL
+    };
+    
+    for (int i = 0; ifb_cmds[i] != NULL; i++) {
+        err = execute_system_cmd(ifb_cmds[i], false);
+        if (err) {
+            fprintf(stderr, "Error: failed to setup IFB device\n");
+            return err;
+        }
+    }
+    
+    /* Setup ingress qdisc and mirroring on the specified interface */
+    char cmd[512];
+    
+    /* Delete existing ingress qdisc if any - ignore failures */
+    snprintf(cmd, sizeof(cmd), "tc qdisc del dev %s ingress 2>/dev/null", iface);
+    execute_system_cmd(cmd, true);
+    
+    /* Add ingress qdisc */
+    snprintf(cmd, sizeof(cmd), "tc qdisc add dev %s ingress handle ffff:", iface);
+    err = execute_system_cmd(cmd, false);
+    if (err) {
+        fprintf(stderr, "Error: failed to add ingress qdisc to %s\n", iface);
+        return err;
+    }
+    
+    /* Add filter to mirror ingress traffic to ifb0 egress */
+    snprintf(cmd, sizeof(cmd), 
+             "tc filter add dev %s parent ffff: protocol ip u32 match u32 0 0 "
+             "action connmark action mirred egress redirect dev ifb0 flowid ffff:1", 
+             iface);
+    err = execute_system_cmd(cmd, false);
+    if (err) {
+        fprintf(stderr, "Error: failed to add ingress mirroring filter\n");
+        return err;
+    }
+    
+    printf("Successfully setup IFB mirroring:\n");
+    printf("  - Ingress traffic from %s mirrored to ifb0 egress\n", iface);
+    
+    if (env.verbose) {
+        printf("\nVerification - IFB status:\n");
+        execute_system_cmd("ip link show ifb0", true);
+        
+        printf("\nTC configuration on %s ingress:\n", iface);
+        snprintf(cmd, sizeof(cmd), "tc qdisc show dev %s", iface);
+        execute_system_cmd(cmd, true);
+        snprintf(cmd, sizeof(cmd), "tc filter show dev %s parent ffff:", iface);
+        execute_system_cmd(cmd, true);
+    }
+    
+    return 0;
+}
+
+/* New function: Setup TC qdisc and classes on ifb0 */
+static int setup_ifb0_qdisc(void)
+{
+    char cmd[512];
+    int err;
+    
+    printf("Setting up TC qdisc and classes on ifb0 for egress shaping...\n");
+    
+    /* Delete existing qdisc - ignore failures */
+    snprintf(cmd, sizeof(cmd), "tc qdisc del dev ifb0 root 2>/dev/null");
+    err = execute_system_cmd(cmd, true);
+    if (err && env.verbose) {
+        printf("Note: No existing qdisc to delete on ifb0 (may be normal)\n");
+    }
+    
+    /* Add root qdisc */
+    snprintf(cmd, sizeof(cmd), "tc qdisc add dev ifb0 root handle 1:0 htb default 30");
+    err = execute_system_cmd(cmd, false);
+    if (err) {
+        fprintf(stderr, "Error: failed to add root qdisc to ifb0\n");
+        return err;
+    }
+    
+    /* Add main class */
+    snprintf(cmd, sizeof(cmd), "tc class add dev ifb0 parent 1:0 classid 1:1 htb rate %s", env.limit);
+    err = execute_system_cmd(cmd, false);
+    if (err) {
+        fprintf(stderr, "Error: failed to add main class to ifb0\n");
+        return err;
+    }
+    
+    /* Add default class */
+    snprintf(cmd, sizeof(cmd), "tc class add dev ifb0 parent 1:1 classid 1:30 htb rate %s ceil %s", 
+             env.start_rate, env.default_limit);
+    err = execute_system_cmd(cmd, false);
+    if (err) {
+        fprintf(stderr, "Error: failed to add default class to ifb0\n");
+        return err;
+    }
+    
+    printf("Successfully setup TC qdisc and classes on ifb0\n");
+    
+    if (env.verbose) {
+        printf("\nTC configuration on ifb0:\n");
+        execute_system_cmd("tc qdisc show dev ifb0", true);
+        execute_system_cmd("tc class show dev ifb0", true);
+    }
+    
+    return 0;
+}
+
+/* New function: Cleanup IFB setup */
+static int cleanup_ifb_setup(const char *iface)
+{
+    printf("Cleaning up IFB mirroring setup...\n");
+    
+    char cmd[512];
+    int err;
+    
+    /* Cleanup ingress on the interface */
+    snprintf(cmd, sizeof(cmd), "tc qdisc del dev %s ingress 2>/dev/null", iface);
+    err = execute_system_cmd(cmd, true);
+    if (err == 0) {
+        printf("Removed ingress qdisc from %s\n", iface);
+    }
+    
+    /* Cleanup ifb0 */
+    snprintf(cmd, sizeof(cmd), "tc qdisc del dev ifb0 root 2>/dev/null");
+    err = execute_system_cmd(cmd, true);
+    if (err == 0) {
+        printf("Removed root qdisc from ifb0\n");
+    }
+    
+    /* Bring down ifb0 */
+    execute_system_cmd("ip link set dev ifb0 down 2>/dev/null", true);
+    
+    printf("IFB mirroring cleanup completed\n");
+    return 0;
+}
+
+/* Modified function: Attach BPF program to interface with better logic */
+static int attach_bpf_to_interface(const char *iface, const char *bpf_obj_path)
+{
+    char cmd[512];
+    int err;
+    
+    printf("Attaching BPF program to %s...\n", iface);
+    
+    cleanup_pinned_maps();
+    
+    /* Delete existing filter - ignore failures */
+    snprintf(cmd, sizeof(cmd), "tc filter del dev %s protocol ip parent 1:0 2>/dev/null", iface);
+    err = execute_system_cmd(cmd, true);
+    if (err && env.verbose) {
+        printf("Note: No existing filter to delete on %s (may be normal)\n", iface);
+    }
+    
+    /* Attach BPF program */
+    snprintf(cmd, sizeof(cmd),
+             "tc filter add dev %s protocol ip parent 1:0 "
+             "bpf obj %s classid 1: direct-action",
+             iface, bpf_obj_path);
+    
+    err = execute_system_cmd(cmd, false);
+    if (err) {
+        fprintf(stderr, "Error: failed to attach BPF program to %s via tc command\n", iface);
+        return err;
+    }
+    
+    printf("Successfully attached BPF program to %s egress (parent 1:0)\n", iface);
+    
+    if (get_pinned_map("cls_filter_port_map") < 0 ||
+        get_pinned_map("cls_filter_ip_trie_map") < 0) {
+        fprintf(stderr, "Warning: BPF maps were not pinned. Check LIBBPF_PIN_BY_NAME in BPF program.\n");
+    } else {
+        printf("BPF maps automatically pinned to /sys/fs/bpf/tc/globals/\n");
+    }
+    
+    if (env.verbose) {
+        snprintf(cmd, sizeof(cmd), "tc filter show dev %s parent 1:0", iface);
+        printf("Verification:\n");
+        execute_system_cmd(cmd, true);
+        
+        printf("Pinned maps:\n");
+        execute_system_cmd("ls -la /sys/fs/bpf/tc/globals/ 2>/dev/null || echo 'No pinned maps found'", true);
     }
     
     return 0;
@@ -663,53 +897,6 @@ static int setup_tc_qdisc(const char *iface)
     return 0;
 }
 
-static int attach_bpf_with_tc(const char *iface, const char *bpf_obj_path)
-{
-    char cmd[512];
-    int err;
-    
-    cleanup_pinned_maps();
-    
-    /* Delete existing filter - ignore failures */
-    snprintf(cmd, sizeof(cmd), "tc filter del dev %s protocol ip parent 1:0 2>/dev/null", iface);
-    err = execute_system_cmd(cmd, true);
-    if (err && env.verbose) {
-        printf("Note: No existing filter to delete on %s (may be normal)\n", iface);
-    }
-    
-    /* Attach BPF program */
-    snprintf(cmd, sizeof(cmd),
-             "tc filter add dev %s protocol ip parent 1:0 "
-             "bpf obj %s classid 1: direct-action",
-             iface, bpf_obj_path);
-    
-    err = execute_system_cmd(cmd, false);
-    if (err) {
-        fprintf(stderr, "Error: failed to attach BPF program via tc command\n");
-        return err;
-    }
-    
-    printf("Successfully attached BPF program to %s egress (parent 1:0)\n", iface);
-    
-    if (get_pinned_map("cls_filter_port_map") < 0 ||
-        get_pinned_map("cls_filter_ip_trie_map") < 0) {
-        fprintf(stderr, "Warning: BPF maps were not pinned. Check LIBBPF_PIN_BY_NAME in BPF program.\n");
-    } else {
-        printf("BPF maps automatically pinned to /sys/fs/bpf/tc/globals/\n");
-    }
-    
-    if (env.verbose) {
-        snprintf(cmd, sizeof(cmd), "tc filter show dev %s parent 1:0", iface);
-        printf("Verification:\n");
-        execute_system_cmd(cmd, true);
-        
-        printf("Pinned maps:\n");
-        execute_system_cmd("ls -la /sys/fs/bpf/tc/globals/ 2>/dev/null || echo 'No pinned maps found'", true);
-    }
-    
-    return 0;
-}
-
 static int detach_bpf_with_tc(const char *iface)
 {
     char cmd[256];
@@ -748,13 +935,14 @@ int main(int argc, char **argv)
     bool attach = false;
     bool detach = false;
     bool setup_qdisc = false;
+    bool setup_ifb = false;
     
-    env.bpf_obj_path = "class_filter.bpf.o";
+    env.bpf_obj_path = "/usr/lib/bpf/class_filter.bpf.o";
     env.limit = "100mbit";
     env.start_rate = "5mbit";
     env.default_limit = "20mbit";
     
-    while ((opt = getopt_long(argc, argv, "i:b:vp:r:d:x:lmaDsL:S:3:h", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:b:vp:r:d:x:lmaDsIL:S:3:h", long_options, NULL)) != -1) {
         switch (opt) {
         case 'i': env.iface = optarg; break;
         case 'b': env.bpf_obj_path = optarg; break;
@@ -768,6 +956,7 @@ int main(int argc, char **argv)
         case 'a': attach = true; break;
         case 'D': detach = true; break;
         case 's': setup_qdisc = true; break;
+        case 'I': setup_ifb = true; break;
         case 'L': env.limit = optarg; break;
         case 'S': env.start_rate = optarg; break;
         case '3': env.default_limit = optarg; break;
@@ -777,7 +966,38 @@ int main(int argc, char **argv)
     }
     
     if (detach && env.iface) {
+        /* Cleanup IFB setup if it was configured */
+        if (strcmp(env.iface, "green0") == 0 || strcmp(env.iface, "ifb0") == 0) {
+            cleanup_ifb_setup("green0");
+        }
         return detach_bpf_with_tc(env.iface);
+    }
+    
+    if (setup_ifb && env.iface) {
+        /* Setup IFB mirroring on the specified interface (usually green0) */
+        err = setup_ifb_mirroring(env.iface);
+        if (err) return err;
+        
+        /* Setup TC qdisc on ifb0 for egress shaping */
+        err = setup_ifb0_qdisc();
+        if (err) return err;
+        
+        /* If attach flag is also provided, attach BPF to ifb0 */
+        if (attach) {
+            printf("\nAutomatically attaching BPF program to ifb0 for classification...\n");
+            err = attach_bpf_to_interface("ifb0", env.bpf_obj_path);
+            if (err) return err;
+            
+            printf("\nComplete setup finished:\n");
+            printf("  - IFB mirroring configured on %s -> ifb0\n", env.iface);
+            printf("  - TC qdisc and classes setup on ifb0\n");
+            printf("  - BPF classifier attached to ifb0 egress\n");
+            printf("  - Ready for port/IP based traffic classification!\n");
+        } else {
+            printf("\nIFB setup complete. Use --attach to attach BPF program to ifb0 for classification.\n");
+        }
+        
+        return 0;
     }
     
     if (setup_qdisc && env.iface) {
@@ -822,11 +1042,11 @@ int main(int argc, char **argv)
             if (err) return err < 0 ? -err : err;
         }
     } else if (attach && env.iface) {
-        printf("Setting up TC qdisc and classes...\n");
+        printf("Setting up TC qdisc and classes on %s...\n", env.iface);
         err = setup_tc_qdisc(env.iface);
         if (err) return err;
         
-        err = attach_bpf_with_tc(env.iface, env.bpf_obj_path);
+        err = attach_bpf_to_interface(env.iface, env.bpf_obj_path);
         if (err) return err;
         
         printf("\nBPF program loaded and attached successfully to %s egress\n", env.iface);
