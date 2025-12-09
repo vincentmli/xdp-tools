@@ -321,9 +321,11 @@ int xdp_dns_denylist(struct xdp_md *ctx)
 			//bpf_printk("domain_key  %s copy_len is %d from %pI4", dkey.data, copy_len, &ipv4->saddr);
 
 			if (bpf_map_lookup_elem(&domain_denylist, &dkey)) {
+				/*
 				bpf_printk(
 					"Domain %s found in denylist, dropping packet\n",
 					dkey.data);
+					*/
 				return XDP_DROP;
 			}
 

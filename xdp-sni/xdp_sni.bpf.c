@@ -232,12 +232,9 @@ int xdp_tls_sni(struct xdp_md *ctx)
 
 			server_name[MAX_DOMAIN_SIZE] = '\0';
 
-			bpf_printk("TLS SNI: %s", server_name);
+			//bpf_printk("TLS SNI: %s", server_name);
 
 			if (bpf_map_lookup_elem(&sni_denylist, &server_name)) {
-				bpf_printk(
-					"Domain %s found in denylist, dropping packet\n",
-					server_name);
 				return XDP_DROP;
 			}
 
