@@ -26,18 +26,13 @@
 #include <linux/tcp.h>
 #include <linux/in.h>
 
-struct ipv4_lpm_key {
-    __u32 prefixlen;
-    __u32 addr;
-};
-
+// Hash map for IP blocking (only IPv4, single IPs)
 struct {
-    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1000000);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
-    __uint(map_flags, BPF_F_NO_PREALLOC);
-    __type(key, struct ipv4_lpm_key);
-    __type(value, __u8);
+    __type(key, __u32);      // IPv4 address in network byte order
+    __type(value, __u8);     // Action (1 = block)
 } ipblocklist_map SEC(".maps");
 
 SEC("xdp")
@@ -47,35 +42,30 @@ int xdp_ipblocklist(struct xdp_md *ctx) {
     struct ethhdr *eth = data;
     struct iphdr *iph;
     
+    // Check Ethernet header bounds
     if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
 
+    // Only process IPv4 packets
     if (eth->h_proto != __constant_htons(ETH_P_IP))
         return XDP_PASS;
 
     iph = (struct iphdr *)(eth + 1);
+    // Check IP header bounds
     if ((void *)(iph + 1) > data_end)
         return XDP_PASS;
 
     // Check source IP
-    struct ipv4_lpm_key src_key = {
-        .prefixlen = 32,
-        .addr = iph->saddr,
-    };
-
-    __u8 *action = bpf_map_lookup_elem(&ipblocklist_map, &src_key);
+    __u8 *action = bpf_map_lookup_elem(&ipblocklist_map, &iph->saddr);
     if (action && *action == 1) {
+        // Source IP is in blocklist - drop packet
         return XDP_DROP;
     }
 
     // Check destination IP
-    struct ipv4_lpm_key dst_key = {
-        .prefixlen = 32,
-        .addr = iph->daddr,
-    };
-
-    action = bpf_map_lookup_elem(&ipblocklist_map, &dst_key);
+    action = bpf_map_lookup_elem(&ipblocklist_map, &iph->daddr);
     if (action && *action == 1) {
+        // Destination IP is in blocklist - drop packet
         return XDP_DROP;
     }
 
