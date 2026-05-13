@@ -152,7 +152,7 @@ static int batch_add_domains(int map_fd, char domains[][MAX_DOMAIN_SIZE + 1], in
 	return 0;
 }
 
-// Batch delete domains from the map
+// Batch delete domains from the map - FIXED to handle ENOENT by falling back to per-key deletion
 static int batch_delete_domains(int map_fd, char domains[][MAX_DOMAIN_SIZE + 1], int count)
 {
 	if (count == 0)
@@ -174,16 +174,51 @@ static int batch_delete_domains(int map_fd, char domains[][MAX_DOMAIN_SIZE + 1],
 	__u32 batch_count = count;
 	int err = bpf_map_delete_batch(map_fd, keys, &batch_count, NULL);
 	
-	if (err) {
+	// If successful or only ENOENT, we need to handle remaining keys
+	if (err && errno != ENOENT) {
 		fprintf(stderr, "Failed to delete domains in batch: %s (errno: %d)\n", 
 			strerror(errno), errno);
 		free(keys);
 		return -1;
 	}
 	
-	// Check if all domains were deleted
-	if (batch_count != (__u32)count) {
-		fprintf(stderr, "Warning: Only deleted %u out of %d domains\n", batch_count, count);
+	// If we got ENOENT, batch_count indicates how many were deleted before the error
+	// We need to delete the remaining keys one by one
+	if (err && errno == ENOENT) {
+		if (batch_count < (__u32)count) {
+			fprintf(stderr, "Warning: Batch delete stopped at %u out of %d domains, falling back to per-key deletion\n", 
+				batch_count, count);
+			
+			// Delete remaining keys one by one
+			int failed_count = 0;
+			for (__u32 i = batch_count; i < (__u32)count; i++) {
+				if (bpf_map_delete_elem(map_fd, &keys[i]) != 0) {
+					if (errno != ENOENT) {
+						fprintf(stderr, "Warning: Failed to delete domain %s: %s\n", 
+							domains[i], strerror(errno));
+						failed_count++;
+					}
+					// ENOENT is ignored - domain already not in map
+				}
+			}
+			
+			if (failed_count > 0) {
+				fprintf(stderr, "Warning: %d domains failed to delete\n", failed_count);
+			}
+		}
+	} else if (!err) {
+		// Check if all domains were deleted (only when no error occurred)
+		if (batch_count != (__u32)count) {
+			fprintf(stderr, "Warning: Only deleted %u out of %d domains\n", batch_count, count);
+			
+			// Delete remaining keys one by one
+			for (__u32 i = batch_count; i < (__u32)count; i++) {
+				if (bpf_map_delete_elem(map_fd, &keys[i]) != 0 && errno != ENOENT) {
+					fprintf(stderr, "Warning: Failed to delete domain %s: %s\n", 
+						domains[i], strerror(errno));
+				}
+			}
+		}
 	}
 	
 	free(keys);
