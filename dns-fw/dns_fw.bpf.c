@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2021, NLnet Labs. All rights reserved.
- * Copyright (c) 2024, BPFire.  All rights reserved.
+ * Copyright (c) 2024 - 2026, LoongFire.  All rights reserved.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -63,17 +63,33 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } dns_fw_blocklist SEC(".maps");
 
-struct {
-	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, 1 << 12); // 4KB buffer
-	__uint(pinning, LIBBPF_PIN_BY_NAME);
-} dns_fw_ringbuf SEC(".maps");
+/*
+ * DEBUG: ringbuf was removed because bpf_ringbuf_reserve() returns NULL
+ * when the buffer is full, and the original code returned XDP_PASS on
+ * that failure -- silently bypassing the blocklist for all DNS queries
+ * once the 4KB buffer was exhausted.  If ringbuf logging is needed in
+ * future, ensure the map lookup happens BEFORE the ringbuf reserve so
+ * a full buffer can never bypass firewall logic.  To restore, uncomment
+ * the block below and the ringbuf code inside dns_fw().
+ *
+ * #define DNS_FW_RINGBUF_ENABLE
+ */
 
-struct qname_event {
-	__u8 len;
-	__u32 src_ip; // Store IPv4 address
-	char qname[MAX_DOMAIN_SIZE + 1];
-};
+/* DEBUG_RINGBUF_BEGIN -- uncomment #define above to enable
+ *
+ * struct {
+ *	__uint(type, BPF_MAP_TYPE_RINGBUF);
+ *	__uint(max_entries, 1 << 12); // 4KB buffer
+ *	__uint(pinning, LIBBPF_PIN_BY_NAME);
+ * } dns_fw_ringbuf SEC(".maps");
+ *
+ * struct qname_event {
+ *	__u8 len;
+ *	__u32 src_ip; // Store IPv4 address
+ *	char qname[MAX_DOMAIN_SIZE + 1];
+ * };
+ *
+ * DEBUG_RINGBUF_END */
 
 /*
  *  Store the VLAN header
@@ -213,6 +229,31 @@ static __always_inline __u8 custom_strlen(const char *str, struct cursor *c)
 	return len;
 }
 
+/*
+ * DEBUG: is_letsbond() -- uncomment to enable targeted bpf_printk tracing
+ * for letsbond.com without flooding trace_pipe with all DNS queries.
+ * Compares the first 14 bytes of dkey against the wire format of
+ * "letsbond.com": \x08letsbond\x03com\x00
+ * Used together with the DEBUG_PRINTK block inside dns_fw() below.
+ *
+ * static __always_inline int is_letsbond(const struct domain_key *dkey)
+ * {
+ *	const char expected[14] = {
+ *		0x08,
+ *		'l','e','t','s','b','o','n','d',
+ *		0x03,
+ *		'c','o','m',
+ *		0x00
+ *	};
+ * #pragma unroll
+ *	for (int i = 0; i < 14; i++) {
+ *		if (dkey->data[i] != expected[i])
+ *			return 0;
+ *	}
+ *	return 1;
+ * }
+ */
+
 SEC("xdp")
 int dns_fw(struct xdp_md *ctx)
 {
@@ -262,26 +303,64 @@ int dns_fw(struct xdp_md *ctx)
 			int copy_len = len < MAX_DOMAIN_SIZE ? len :
 							       MAX_DOMAIN_SIZE;
 
-			// Allocate a buffer from the ring buffer
-			struct qname_event *event = bpf_ringbuf_reserve(
-				&dns_fw_ringbuf, sizeof(*event), 0);
-
-			if (!event)
-				return XDP_PASS; // Drop if no space
-
-			// Set event fields
-			event->len = copy_len;
-			event->src_ip =
-				ipv4->saddr; // Extract source IP address
-			custom_memcpy(event->qname, qname, copy_len);
-			event->qname[copy_len] =
-				'\0'; // Ensure null termination
-
-			// Submit the event
-			bpf_ringbuf_submit(event, 0);
+			/* DEBUG_RINGBUF_BEGIN -- restore ringbuf logging here
+			 * if needed; see map definition comments above.
+			 * WARNING: always perform map lookup BEFORE ringbuf
+			 * reserve to prevent a full buffer bypassing the
+			 * blocklist.
+			 *
+			 * struct qname_event *event = bpf_ringbuf_reserve(
+			 *	&dns_fw_ringbuf, sizeof(*event), 0);
+			 * if (!event)
+			 *	return XDP_PASS; // Drop if no space
+			 * event->len = copy_len;
+			 * event->src_ip = ipv4->saddr;
+			 * custom_memcpy(event->qname, qname, copy_len);
+			 * event->qname[copy_len] = '\0';
+			 * bpf_ringbuf_submit(event, 0);
+			 *
+			 * DEBUG_RINGBUF_END */
 
 			custom_memcpy(dkey.data, qname, copy_len);
 			dkey.data[copy_len] = '\0'; // Ensure null-termination
+
+			/* DEBUG_PRINTK_BEGIN -- uncomment is_letsbond() above
+			 * and this block to trace letsbond.com lookups via
+			 * trace_pipe without noise from other domains.
+			 * Read with: cat /sys/kernel/debug/tracing/trace_pipe
+			 * bpf_printk supports max 3 format args per call.
+			 *
+			 * if (is_letsbond(&dkey)) {
+			 *	bpf_printk("DNS_FW_DEBUG letsbond.com seen len=%d",
+			 *		   copy_len);
+			 *	bpf_printk("DNS_FW_DEBUG key[0-2]: %02x %02x %02x",
+			 *		   (unsigned char)dkey.data[0],
+			 *		   (unsigned char)dkey.data[1],
+			 *		   (unsigned char)dkey.data[2]);
+			 *	bpf_printk("DNS_FW_DEBUG key[3-5]: %02x %02x %02x",
+			 *		   (unsigned char)dkey.data[3],
+			 *		   (unsigned char)dkey.data[4],
+			 *		   (unsigned char)dkey.data[5]);
+			 *	bpf_printk("DNS_FW_DEBUG key[6-8]: %02x %02x %02x",
+			 *		   (unsigned char)dkey.data[6],
+			 *		   (unsigned char)dkey.data[7],
+			 *		   (unsigned char)dkey.data[8]);
+			 *	bpf_printk("DNS_FW_DEBUG key[9-11]: %02x %02x %02x",
+			 *		   (unsigned char)dkey.data[9],
+			 *		   (unsigned char)dkey.data[10],
+			 *		   (unsigned char)dkey.data[11]);
+			 *	bpf_printk("DNS_FW_DEBUG key[12-13]: %02x %02x",
+			 *		   (unsigned char)dkey.data[12],
+			 *		   (unsigned char)dkey.data[13]);
+			 *	if (bpf_map_lookup_elem(&dns_fw_blocklist, &dkey)) {
+			 *		bpf_printk("DNS_FW_DEBUG letsbond.com HIT -> XDP_DROP");
+			 *		return XDP_DROP;
+			 *	}
+			 *	bpf_printk("DNS_FW_DEBUG letsbond.com MISS -> XDP_PASS");
+			 *	break;
+			 * }
+			 *
+			 * DEBUG_PRINTK_END */
 
 			if (bpf_map_lookup_elem(&dns_fw_blocklist, &dkey)) {
 				return XDP_DROP;
