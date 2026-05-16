@@ -250,6 +250,7 @@ int xdp_dns_denylist(struct xdp_md *ctx)
 	char *qname;
 	__u16 eth_proto;
 	__u8 len = 0;
+	int is_blocked = 0;  // Track if domain should be blocked
 
 	struct domain_key dkey = { 0 }; // LPM trie key
 
@@ -279,7 +280,6 @@ int xdp_dns_denylist(struct xdp_md *ctx)
 			}
 
 			len = custom_strlen(qname, &c);
-			//bpf_printk("qname %s len %d ipid %d from %pI4", qname, len, ipv4->id, &ipv4->saddr);
 
 			//avoid R2 offset is outside of the packet error
 			if (qname + len > c.end)
@@ -288,56 +288,40 @@ int xdp_dns_denylist(struct xdp_md *ctx)
 			int copy_len = len < MAX_DOMAIN_SIZE ? len :
 							       MAX_DOMAIN_SIZE;
 
-			// Allocate a buffer from the ring buffer
+			// FIRST: Check if domain should be blocked (CRITICAL PATH)
+			custom_memcpy(dkey.data, qname, copy_len);
+			dkey.data[MAX_DOMAIN_SIZE] = '\0';
+			reverse_string(dkey.data, copy_len);
+			dkey.lpm_key.prefixlen = copy_len * 8;
+
+			// Determine if this domain is blocked
+			if (bpf_map_lookup_elem(&domain_denylist, &dkey)) {
+				is_blocked = 1;
+			}
+
+			// NOW handle logging (optional, but try for ALL queries)
 			struct qname_event *event = bpf_ringbuf_reserve(
 				&dns_ringbuf, sizeof(*event), 0);
 
-		        // Log debug info about event reservation
-			//log_debug_info(ctx, qname, event, len, ipv4->saddr);
+			if (event) {
+				event->len = copy_len;
+				event->src_ip = ipv4->saddr;
+				custom_memcpy(event->qname, qname, copy_len);
+				event->qname[copy_len] = '\0';
+				
+				// Optional: Add a field to indicate if blocked
+				// event->blocked = is_blocked;
+				
+				bpf_ringbuf_submit(event, 0);
+			} else {
+				// Logging failed, but that's OK - we still know if we should block
+				bpf_printk("Ringbuf full, but continuing with blocklist check");
+			}
 
-			if (!event)
-				return XDP_PASS; // Drop if no space
-
-			// Set event fields
-			event->len = copy_len;
-			event->src_ip =
-				ipv4->saddr; // Extract source IP address
-			custom_memcpy(event->qname, qname, copy_len);
-			event->qname[copy_len] =
-				'\0'; // Ensure null termination
-
-			// Submit the event
-			bpf_ringbuf_submit(event, 0);
-
-			custom_memcpy(dkey.data, qname, copy_len);
-			dkey.data[MAX_DOMAIN_SIZE] =
-				'\0'; // Ensure null-termination
-			reverse_string(dkey.data, copy_len);
-
-			// Set the LPM key prefix length (the length of the domain name string)
-			dkey.lpm_key.prefixlen =
-				copy_len * 8; // Prefix length in bits
-
-			//bpf_printk("domain_key  %s copy_len is %d from %pI4", dkey.data, copy_len, &ipv4->saddr);
-
-			if (bpf_map_lookup_elem(&domain_denylist, &dkey)) {
-				/*
-				bpf_printk(
-					"Domain %s found in denylist, dropping packet\n",
-					dkey.data);
-					*/
+			// FINALLY: Take action based on blocklist result
+			if (is_blocked) {
 				return XDP_DROP;
 			}
-
-/*
-			__u8 value = 1;
-			if (bpf_map_update_elem(&domain_denylist, &dkey, &value, BPF_ANY) < 0) {
-				bpf_printk("Domain %s not updated in denylist\n", dkey.data);
-			} else {
-				bpf_printk("Domain %s updated in denylist\n", dkey.data);
-			}
-*/
-
 			break;
 		}
 	}
