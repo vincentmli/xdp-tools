@@ -59,7 +59,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, struct domain_key);
 	__type(value, __u8);
-	__uint(max_entries, 1000000);
+	__uint(max_entries, 1500000);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } dns_fw_blocklist SEC(".maps");
 
