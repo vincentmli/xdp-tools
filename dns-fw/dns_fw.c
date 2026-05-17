@@ -43,6 +43,7 @@ static int load_and_process_domains(const char *filename, int map_fd, int is_add
 static int list_all_domains(int map_fd);
 static int manage_single_domain(int map_fd, const char *command, const char *domain);
 static int validate_domain(const char *domain);
+static int clear_all_domains(int map_fd);
 static void print_usage(const char *prog);
 
 // Function to validate domain name according to RFC 1035
@@ -271,6 +272,99 @@ static int batch_delete_domains(int map_fd, char domains[][MAX_DOMAIN_NAME + 1],
 	
 	free(keys);
 	return 0;
+}
+
+// Clear all domains from the map using batch operations
+static int clear_all_domains(int map_fd)
+{
+    printf("Clearing all domains from denylist...\n");
+    
+    struct domain_key *keys = calloc(MAX_DOMAINS_PER_BATCH, sizeof(struct domain_key));
+    if (!keys) {
+        fprintf(stderr, "Failed to allocate memory for batch clear\n");
+        return -1;
+    }
+    
+    struct domain_key next_key = {0};
+    struct domain_key key_ptr = {0};
+    int batch_count = 0;
+    int total_deleted = 0;
+    int iteration = 0;
+    int first = 1;
+    
+    // First pass: collect keys in batches and delete
+    while (bpf_map_get_next_key(map_fd, first ? NULL : &key_ptr, &next_key) == 0) {
+        // Store the current key
+        memcpy(&keys[batch_count], &next_key, sizeof(struct domain_key));
+        memcpy(&key_ptr, &next_key, sizeof(struct domain_key));
+        batch_count++;
+        first = 0;
+        
+        // If batch is full, delete it
+        if (batch_count >= MAX_DOMAINS_PER_BATCH) {
+            __u32 num_to_delete = batch_count;
+            int ret = bpf_map_delete_batch(map_fd, keys, &num_to_delete, NULL);
+            
+            if (ret == 0) {
+                total_deleted += num_to_delete;
+            } else {
+                // Fall back to individual deletion for this batch
+                fprintf(stderr, "Batch delete failed for batch %d, falling back to individual deletion\n", iteration);
+                for (int i = 0; i < batch_count; i++) {
+                    if (bpf_map_delete_elem(map_fd, &keys[i]) == 0) {
+                        total_deleted++;
+                    }
+                }
+            }
+            
+            batch_count = 0;
+            iteration++;
+            
+            // Progress indicator for large maps
+            if (iteration % 10 == 0 && iteration > 0) {
+                printf("  Cleared %d domains so far...\n", total_deleted);
+            }
+        }
+    }
+    
+    // Delete any remaining keys in the last partial batch
+    if (batch_count > 0) {
+        __u32 num_to_delete = batch_count;
+        int ret = bpf_map_delete_batch(map_fd, keys, &num_to_delete, NULL);
+        
+        if (ret == 0) {
+            total_deleted += num_to_delete;
+        } else {
+            // Fall back to individual deletion for remaining keys
+            for (int i = 0; i < batch_count; i++) {
+                if (bpf_map_delete_elem(map_fd, &keys[i]) == 0) {
+                    total_deleted++;
+                }
+            }
+        }
+    }
+    
+    // Second pass: catch any leftovers (safety measure)
+    iteration = 0;
+    first = 1;
+    memset(&next_key, 0, sizeof(next_key));
+    while (bpf_map_get_next_key(map_fd, first ? NULL : &key_ptr, &next_key) == 0) {
+        struct domain_key key_to_delete;
+        memcpy(&key_to_delete, &next_key, sizeof(struct domain_key));
+        memcpy(&key_ptr, &next_key, sizeof(struct domain_key));
+        first = 0;
+        
+        if (bpf_map_delete_elem(map_fd, &key_to_delete) == 0) {
+            total_deleted++;
+            if (++iteration % 1000 == 0) {
+                printf("  Cleaning up %d more domains...\n", iteration);
+            }
+        }
+    }
+    
+    free(keys);
+    printf("Successfully cleared %d domains from denylist\n", total_deleted);
+    return 0;
 }
 
 // Safe string copy function that ensures null termination
@@ -545,19 +639,7 @@ int main(int argc, char *argv[])
 	} else if (strcmp(command, "list") == 0 && argc == 3) {
 		ret = list_all_domains(map_fd);
 	} else if (strcmp(command, "clear") == 0 && argc == 3) {
-		// Implement clear by walking and deleting all entries
-		struct domain_key key = { 0 };
-		__u32 next_key = 0;
-		int count = 0;
-		
-		while (bpf_map_get_next_key(map_fd, &next_key, &key) == 0) {
-			next_key = *(int *)&key;
-			if (bpf_map_delete_elem(map_fd, &key) == 0) {
-				count++;
-			}
-		}
-		printf("Cleared %d domains from denylist\n", count);
-		ret = 0;
+		ret = clear_all_domains(map_fd);
 	} else {
 		fprintf(stderr, "Invalid command or arguments\n");
 		print_usage(argv[0]);
