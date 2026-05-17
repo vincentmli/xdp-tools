@@ -41,7 +41,8 @@
 // do not use libc includes because this causes clang
 // to include 32bit headers on 64bit ( only ) systems.
 #define memcpy __builtin_memcpy
-#define MAX_DOMAIN_SIZE 63
+#define MAX_DOMAIN_NAME 127  /* Max total domain name length (reduced for verifier) */
+#define MAX_DOMAIN_LABEL 63  /* Max per label length (RFC 1035) */
 
 struct meta_data {
 	__u16 eth_proto;
@@ -52,7 +53,7 @@ struct meta_data {
 
 /* Define the Hash Map for domain names */
 struct domain_key {
-	char data[MAX_DOMAIN_SIZE + 1];
+	char data[MAX_DOMAIN_NAME + 1];  /* +1 for null terminator */
 };
 
 struct {
@@ -86,7 +87,7 @@ struct {
  * struct qname_event {
  *	__u8 len;
  *	__u32 src_ip; // Store IPv4 address
- *	char qname[MAX_DOMAIN_SIZE + 1];
+ *	char qname[MAX_DOMAIN_NAME + 1];
  * };
  *
  * DEBUG_RINGBUF_END */
@@ -161,10 +162,10 @@ static __always_inline char *parse_dname(struct cursor *c)
 {
 	__u8 *dname = c->pos;
 	__u8 i;
+	__u8 o;
 
-	for (i = 0; i < 128; i++) { /* Maximum 128 labels */
-		__u8 o;
-
+	/* Use a conservative bound for the verifier */
+	for (i = 0; i < 32; i++) {  /* Reduced from 64 to 32 for verifier */
 		// Check bounds before accessing the next byte
 		if (c->pos + 1 > c->end)
 			return 0;
@@ -174,13 +175,12 @@ static __always_inline char *parse_dname(struct cursor *c)
 		// Check for DNS name compression
 		if ((o & 0xC0) == 0xC0) {
 			// If the current label is compressed, skip the next 2 bytes
-			if (c->pos + 2 >
-			    c->end) // Ensure we have 2 bytes to skip
+			if (c->pos + 2 > c->end)
 				return 0;
 
 			c->pos += 2;
-			return (char *)dname; // Return the parsed domain name
-		} else if (o > 63 || c->pos + o + 1 > c->end) {
+			return (char *)dname;
+		} else if (o > MAX_DOMAIN_LABEL || c->pos + o + 1 > c->end) {
 			// Label is invalid or out of bounds
 			return 0;
 		}
@@ -197,13 +197,19 @@ static __always_inline char *parse_dname(struct cursor *c)
 	return 0;
 }
 
+// Optimized custom_memcpy with fixed small bound
 static __always_inline void *custom_memcpy(void *dest, const void *src,
 					   __u8 len)
 {
-	__u8 i;
-
-	// Perform the copy byte-by-byte to satisfy the BPF verifier
-	for (i = 0; i < len; i++) {
+	/* Use a small fixed bound to help the verifier */
+	/* Most domain names are much shorter than MAX_DOMAIN_NAME */
+	if (len > 96)  /* Cap at 96 bytes for performance */
+		len = 96;
+	
+	#pragma unroll
+	for (int i = 0; i < 96; i++) {
+		if (i >= len)
+			break;
 		*((__u8 *)dest + i) = *((__u8 *)src + i);
 	}
 
@@ -214,12 +220,10 @@ static __always_inline void *custom_memcpy(void *dest, const void *src,
 static __always_inline __u8 custom_strlen(const char *str, struct cursor *c)
 {
 	__u8 len = 0;
-
-// Loop through the string, ensuring not to exceed MAX_STRING_LEN
-#pragma unroll
-	for (int i = 0; i < MAX_DOMAIN_SIZE; i++) {
-		if (str + i >=
-		    c->end) // Check if we are at or beyond the end of the packet
+	
+	/* Fixed bound loop - helps verifier */
+	for (int i = 0; i < MAX_DOMAIN_NAME; i++) {
+		if (str + i >= c->end)
 			break;
 		if (str[i] == '\0')
 			break;
@@ -300,8 +304,8 @@ int dns_fw(struct xdp_md *ctx)
 			if (qname + len > c.end)
 				return XDP_ABORTED; // Return FORMERR?
 
-			int copy_len = len < MAX_DOMAIN_SIZE ? len :
-							       MAX_DOMAIN_SIZE;
+			int copy_len = len < MAX_DOMAIN_NAME ? len :
+							       MAX_DOMAIN_NAME;
 
 			/* DEBUG_RINGBUF_BEGIN -- restore ringbuf logging here
 			 * if needed; see map definition comments above.

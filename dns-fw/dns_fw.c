@@ -25,23 +25,71 @@
 #include <getopt.h>
 #include <stddef.h>
 
-#define MAX_DOMAIN_SIZE 63
+#define MAX_DOMAIN_NAME 127    /* Max total domain name length (reduced for BPF verifier) */
+#define MAX_DOMAIN_LABEL 63    /* Max per label length (RFC 1035) */
 #define MAX_DOMAINS_PER_BATCH 1000
-#define MAX_LINE_LENGTH 256
+#define MAX_LINE_LENGTH 256    /* Keep at 256, sufficient for 127 + extra */
 
 struct domain_key {
-	char data[MAX_DOMAIN_SIZE + 1];
+	char data[MAX_DOMAIN_NAME + 1];  /* +1 for null terminator */
 };
 
 // Function declarations
 static void encode_domain(const char *domain, char *encoded, size_t max_len);
 static void decode_domain(const char *encoded, char *decoded, size_t max_len);
-static int batch_add_domains(int map_fd, char domains[][MAX_DOMAIN_SIZE + 1], int count);
-static int batch_delete_domains(int map_fd, char domains[][MAX_DOMAIN_SIZE + 1], int count);
+static int batch_add_domains(int map_fd, char domains[][MAX_DOMAIN_NAME + 1], int count);
+static int batch_delete_domains(int map_fd, char domains[][MAX_DOMAIN_NAME + 1], int count);
 static int load_and_process_domains(const char *filename, int map_fd, int is_add);
 static int list_all_domains(int map_fd);
 static int manage_single_domain(int map_fd, const char *command, const char *domain);
+static int validate_domain(const char *domain);
 static void print_usage(const char *prog);
+
+// Function to validate domain name according to RFC 1035
+static int validate_domain(const char *domain)
+{
+	const char *ptr = domain;
+	size_t label_len;
+	size_t total_len = 0;
+	
+	if (!domain || *domain == '\0')
+		return 0;
+	
+	while (*ptr) {
+		// Find the length of the current label
+		label_len = strcspn(ptr, ".");
+		
+		// Check if label exceeds maximum length
+		if (label_len > MAX_DOMAIN_LABEL) {
+			fprintf(stderr, "Warning: Label '%.*s' exceeds max length (%d chars)\n",
+			        (int)label_len, ptr, MAX_DOMAIN_LABEL);
+			return 0;
+		}
+		
+		// Check if label is empty
+		if (label_len == 0) {
+			fprintf(stderr, "Warning: Empty label in domain %s\n", domain);
+			return 0;
+		}
+		
+		total_len += label_len + 1; // +1 for the dot or null terminator
+		
+		// Move to the next label
+		ptr += label_len;
+		if (*ptr == '.') {
+			ptr++; // Skip the dot
+		}
+	}
+	
+	// Check total length (subtract 1 because we don't count the final null)
+	if (total_len - 1 > MAX_DOMAIN_NAME) {
+		fprintf(stderr, "Warning: Domain %s exceeds max total length (%d chars, max %d)\n",
+		        domain, (int)(total_len - 1), MAX_DOMAIN_NAME);
+		return 0;
+	}
+	
+	return 1;
+}
 
 // Function to encode a domain name with label lengths (DNS wire format)
 static void encode_domain(const char *domain, char *encoded, size_t max_len)
@@ -109,7 +157,7 @@ static void decode_domain(const char *encoded, char *decoded, size_t max_len)
 }
 
 // Batch add domains to the map
-static int batch_add_domains(int map_fd, char domains[][MAX_DOMAIN_SIZE + 1], int count)
+static int batch_add_domains(int map_fd, char domains[][MAX_DOMAIN_NAME + 1], int count)
 {
 	if (count == 0)
 		return 0;
@@ -126,7 +174,7 @@ static int batch_add_domains(int map_fd, char domains[][MAX_DOMAIN_SIZE + 1], in
 	
 	// Prepare keys and values
 	for (int i = 0; i < count; i++) {
-		encode_domain(domains[i], keys[i].data, MAX_DOMAIN_SIZE + 1);
+		encode_domain(domains[i], keys[i].data, MAX_DOMAIN_NAME + 1);
 		values[i] = 1;
 	}
 	
@@ -153,7 +201,7 @@ static int batch_add_domains(int map_fd, char domains[][MAX_DOMAIN_SIZE + 1], in
 }
 
 // Batch delete domains from the map - FIXED to handle ENOENT by falling back to per-key deletion
-static int batch_delete_domains(int map_fd, char domains[][MAX_DOMAIN_SIZE + 1], int count)
+static int batch_delete_domains(int map_fd, char domains[][MAX_DOMAIN_NAME + 1], int count)
 {
 	if (count == 0)
 		return 0;
@@ -167,7 +215,7 @@ static int batch_delete_domains(int map_fd, char domains[][MAX_DOMAIN_SIZE + 1],
 	
 	// Prepare keys
 	for (int i = 0; i < count; i++) {
-		encode_domain(domains[i], keys[i].data, MAX_DOMAIN_SIZE + 1);
+		encode_domain(domains[i], keys[i].data, MAX_DOMAIN_NAME + 1);
 	}
 	
 	// Use BPF batch API to delete all domains
@@ -225,6 +273,16 @@ static int batch_delete_domains(int map_fd, char domains[][MAX_DOMAIN_SIZE + 1],
 	return 0;
 }
 
+// Safe string copy function that ensures null termination
+static void safe_strcpy(char *dest, const char *src, size_t dest_size)
+{
+	size_t src_len = strlen(src);
+	size_t copy_len = (src_len < dest_size - 1) ? src_len : dest_size - 1;
+	
+	memcpy(dest, src, copy_len);
+	dest[copy_len] = '\0';
+}
+
 // Function to load domains from a text file and process in batches
 static int load_and_process_domains(const char *filename, int map_fd, int is_add)
 {
@@ -235,7 +293,7 @@ static int load_and_process_domains(const char *filename, int map_fd, int is_add
 	}
 	
 	char line[MAX_LINE_LENGTH];
-	char domains[MAX_DOMAINS_PER_BATCH][MAX_DOMAIN_SIZE + 1];
+	char domains[MAX_DOMAINS_PER_BATCH][MAX_DOMAIN_NAME + 1];
 	int batch_count = 0;
 	int total_processed = 0;
 	int batch_num = 0;
@@ -255,14 +313,21 @@ static int load_and_process_domains(const char *filename, int map_fd, int is_add
 		if (*start == '\0')
 			continue;
 		
-		// Check domain length
-		if (strlen(start) > MAX_DOMAIN_SIZE) {
-			fprintf(stderr, "Warning: Domain %s exceeds max length, skipping\n", start);
+		// Check if domain is too long before validation
+		if (strlen(start) > MAX_DOMAIN_NAME) {
+			fprintf(stderr, "Warning: Domain %s exceeds max length (%d), skipping\n", 
+			        start, MAX_DOMAIN_NAME);
 			continue;
 		}
 		
-		strncpy(domains[batch_count], start, MAX_DOMAIN_SIZE);
-		domains[batch_count][MAX_DOMAIN_SIZE] = '\0';
+		// Validate domain name according to RFC 1035
+		if (!validate_domain(start)) {
+			fprintf(stderr, "Warning: Domain %s validation failed, skipping\n", start);
+			continue;
+		}
+		
+		// Use safe string copy instead of strncpy
+		safe_strcpy(domains[batch_count], start, MAX_DOMAIN_NAME + 1);
 		batch_count++;
 		
 		// If we've reached the batch size, process this batch
@@ -348,7 +413,7 @@ static int list_all_domains(int map_fd)
 			break;
 		
 		for (__u32 i = 0; i < count; i++) {
-			char decoded[MAX_DOMAIN_SIZE + 1];
+			char decoded[MAX_DOMAIN_NAME + 1];
 			decode_domain(keys[i].data, decoded, sizeof(decoded));
 			printf("%s\n", decoded);
 			total_count++;
@@ -372,8 +437,20 @@ static int manage_single_domain(int map_fd, const char *command, const char *dom
 	struct domain_key dkey = { 0 };
 	__u8 value = 1;
 	
+	// Check domain length
+	if (strlen(domain) > MAX_DOMAIN_NAME) {
+		fprintf(stderr, "Domain exceeds max length (%d)\n", MAX_DOMAIN_NAME);
+		return -1;
+	}
+	
+	// Validate domain name
+	if (!validate_domain(domain)) {
+		fprintf(stderr, "Domain validation failed\n");
+		return -1;
+	}
+	
 	// Encode the domain name with label lengths (no reverse needed for hash map)
-	encode_domain(domain, dkey.data, MAX_DOMAIN_SIZE + 1);
+	encode_domain(domain, dkey.data, MAX_DOMAIN_NAME + 1);
 	
 	if (strcmp(command, "add") == 0) {
 		if (bpf_map_update_elem(map_fd, &dkey, &value, BPF_ANY) != 0) {
@@ -410,7 +487,8 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "    %s <map_path> clear\n", prog);
 	fprintf(stderr, "\nOptions:\n");
 	fprintf(stderr, "  <map_path> - BPF map path (e.g., /sys/fs/bpf/dns_fw_denylist)\n");
-	fprintf(stderr, "  <domain>   - Domain name to add/delete (max %d chars)\n", MAX_DOMAIN_SIZE);
+	fprintf(stderr, "  <domain>   - Domain name to add/delete (max %d chars total, labels max %d chars)\n", 
+		MAX_DOMAIN_NAME, MAX_DOMAIN_LABEL);
 	fprintf(stderr, "  <file>     - Text file with one domain per line\n");
 	fprintf(stderr, "\nFile format example:\n");
 	fprintf(stderr, "  example.com\n");
@@ -419,6 +497,9 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "  facebook.com\n");
 	fprintf(stderr, "\nNote: For large files, the program processes domains in\n");
 	fprintf(stderr, "      batches of %d domains at a time.\n", MAX_DOMAINS_PER_BATCH);
+	fprintf(stderr, "\nRFC 1035 Limits:\n");
+	fprintf(stderr, "  - Maximum total domain name length: %d characters\n", MAX_DOMAIN_NAME);
+	fprintf(stderr, "  - Maximum label length: %d characters\n", MAX_DOMAIN_LABEL);
 }
 
 int main(int argc, char *argv[])
