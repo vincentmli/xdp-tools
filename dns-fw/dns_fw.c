@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2024, BPFire.  All rights reserved.
+ * Copyright (c) 2024 - 2026, LoongFire.  All rights reserved.
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -45,6 +46,12 @@ static int manage_single_domain(int map_fd, const char *command, const char *dom
 static int validate_domain(const char *domain);
 static int clear_all_domains(int map_fd);
 static void print_usage(const char *prog);
+
+// Custom domain functions
+static int load_custom_domains(const char *filename, int custom_map_fd);
+static int clear_custom_map(int map_fd);
+static int list_custom_domains(int map_fd);
+static int manage_custom_domain(int map_fd, const char *command, const char *domain, const char *status);
 
 // Function to validate domain name according to RFC 1035
 static int validate_domain(const char *domain)
@@ -525,7 +532,7 @@ static int list_all_domains(int map_fd)
 	return 0;
 }
 
-// Add or delete a single domain
+// Add or delete a single domain from denylist
 static int manage_single_domain(int map_fd, const char *command, const char *domain)
 {
 	struct domain_key dkey = { 0 };
@@ -566,34 +573,276 @@ static int manage_single_domain(int map_fd, const char *command, const char *dom
 	return 0;
 }
 
+// ============================================================================
+// Custom domain functions (exceptions/overrides)
+// ============================================================================
+
+// Load custom domains from file (format: domain,status)
+static int load_custom_domains(const char *filename, int custom_map_fd)
+{
+	FILE *file = fopen(filename, "r");
+	if (!file) {
+		fprintf(stderr, "Failed to open custom domains file %s: %s\n", 
+		        filename, strerror(errno));
+		return -1;
+	}
+	
+	char line[MAX_LINE_LENGTH];
+	int total_processed = 0;
+	int errors = 0;
+	
+	printf("Loading custom domains from %s...\n", filename);
+	printf("Format: domain,status (blocked/allowed)\n");
+	printf("----------------------------------------\n");
+	
+	while (fgets(line, sizeof(line), file)) {
+		// Remove newline
+		line[strcspn(line, "\n")] = 0;
+		
+		// Skip empty lines and comments
+		if (line[0] == '\0' || line[0] == '#')
+			continue;
+		
+		// Parse "domain,status" format
+		char *comma = strchr(line, ',');
+		if (!comma) {
+			fprintf(stderr, "Warning: Invalid format (missing comma): %s\n", line);
+			errors++;
+			continue;
+		}
+		
+		*comma = '\0';  // Split the string
+		char *domain = line;
+		char *status_str = comma + 1;
+		
+		// Trim whitespace from domain
+		while (*domain == ' ' || *domain == '\t') domain++;
+		char *domain_end = domain + strlen(domain) - 1;
+		while (domain_end > domain && (*domain_end == ' ' || *domain_end == '\t')) {
+			*domain_end-- = '\0';
+		}
+		
+		// Trim whitespace from status
+		while (*status_str == ' ' || *status_str == '\t') status_str++;
+		char *status_end = status_str + strlen(status_str) - 1;
+		while (status_end > status_str && (*status_end == ' ' || *status_end == '\t')) {
+			*status_end-- = '\0';
+		}
+		
+		// Validate domain
+		if (strlen(domain) > MAX_DOMAIN_NAME) {
+			fprintf(stderr, "Warning: Domain %s exceeds max length, skipping\n", domain);
+			errors++;
+			continue;
+		}
+		
+		if (!validate_domain(domain)) {
+			fprintf(stderr, "Warning: Invalid domain format: %s, skipping\n", domain);
+			errors++;
+			continue;
+		}
+		
+		// Determine status
+		__u8 status;
+		if (strcmp(status_str, "blocked") == 0) {
+			status = 1;
+		} else if (strcmp(status_str, "allowed") == 0) {
+			status = 0;
+		} else {
+			fprintf(stderr, "Warning: Invalid status '%s' for domain %s, skipping\n", 
+			        status_str, domain);
+			errors++;
+			continue;
+		}
+		
+		// Encode domain to DNS wire format
+		struct domain_key dkey = {0};
+		encode_domain(domain, dkey.data, MAX_DOMAIN_NAME + 1);
+		
+		// Add/update the map entry
+		if (bpf_map_update_elem(custom_map_fd, &dkey, &status, BPF_ANY) != 0) {
+			fprintf(stderr, "Failed to add/update domain %s: %s\n", 
+			        domain, strerror(errno));
+			errors++;
+		} else {
+			printf("  %s -> %s\n", domain, status_str);
+			total_processed++;
+		}
+	}
+	
+	fclose(file);
+	printf("----------------------------------------\n");
+	printf("Loaded %d custom domain entries (%d errors)\n", total_processed, errors);
+	return (errors == 0) ? total_processed : -1;
+}
+
+// Clear all custom domains from the map
+static int clear_custom_map(int map_fd)
+{
+	printf("Clearing custom domain map...\n");
+	
+	struct domain_key next_key = {0};
+	struct domain_key key_ptr = {0};
+	int first = 1;
+	int deleted = 0;
+	
+	// Iterate through all keys and delete them one by one
+	while (bpf_map_get_next_key(map_fd, first ? NULL : &key_ptr, &next_key) == 0) {
+		if (bpf_map_delete_elem(map_fd, &next_key) == 0) {
+			deleted++;
+		}
+		memcpy(&key_ptr, &next_key, sizeof(struct domain_key));
+		first = 0;
+	}
+	
+	printf("Cleared %d custom domain entries\n", deleted);
+	return 0;
+}
+
+// List all custom domains with their status
+static int list_custom_domains(int map_fd)
+{
+	struct domain_key next_key = {0};
+	struct domain_key key_ptr = {0};
+	int first = 1;
+	int count = 0;
+	__u8 value;
+	
+	printf("Custom domain exceptions:\n");
+	printf("------------------------\n");
+	
+	while (bpf_map_get_next_key(map_fd, first ? NULL : &key_ptr, &next_key) == 0) {
+		// Get the value (status)
+		if (bpf_map_lookup_elem(map_fd, &next_key, &value) == 0) {
+			char decoded[MAX_DOMAIN_NAME + 1];
+			decode_domain(next_key.data, decoded, sizeof(decoded));
+			printf("%s -> %s\n", decoded, value ? "BLOCKED" : "ALLOWED");
+			count++;
+		}
+		memcpy(&key_ptr, &next_key, sizeof(struct domain_key));
+		first = 0;
+	}
+	
+	printf("------------------------\n");
+	printf("Total: %d custom domain entries\n", count);
+	return 0;
+}
+
+// Manage a single custom domain (add/delete/update)
+static int manage_custom_domain(int map_fd, const char *command, const char *domain, const char *status)
+{
+	struct domain_key dkey = { 0 };
+	
+	// Check domain length
+	if (strlen(domain) > MAX_DOMAIN_NAME) {
+		fprintf(stderr, "Domain exceeds max length (%d)\n", MAX_DOMAIN_NAME);
+		return -1;
+	}
+	
+	// Validate domain name
+	if (!validate_domain(domain)) {
+		fprintf(stderr, "Domain validation failed\n");
+		return -1;
+	}
+	
+	// Encode the domain name
+	encode_domain(domain, dkey.data, MAX_DOMAIN_NAME + 1);
+	
+	if (strcmp(command, "add") == 0 || strcmp(command, "update") == 0) {
+		if (!status) {
+			fprintf(stderr, "Status required for add/update (blocked/allowed)\n");
+			return -1;
+		}
+		
+		__u8 value;
+		if (strcmp(status, "blocked") == 0) {
+			value = 1;
+		} else if (strcmp(status, "allowed") == 0) {
+			value = 0;
+		} else {
+			fprintf(stderr, "Invalid status: %s (must be 'blocked' or 'allowed')\n", status);
+			return -1;
+		}
+		
+		if (bpf_map_update_elem(map_fd, &dkey, &value, BPF_ANY) != 0) {
+			fprintf(stderr, "Failed to add/update custom domain: %s\n", strerror(errno));
+			return -1;
+		}
+		printf("Custom domain %s set to %s\n", domain, status);
+	} else if (strcmp(command, "delete") == 0) {
+		if (bpf_map_delete_elem(map_fd, &dkey) != 0) {
+			fprintf(stderr, "Failed to delete custom domain: %s\n", strerror(errno));
+			return -1;
+		}
+		printf("Custom domain %s removed\n", domain);
+	} else {
+		fprintf(stderr, "Invalid command: %s\n", command);
+		return -1;
+	}
+	
+	return 0;
+}
+
 static void print_usage(const char *prog)
 {
-	fprintf(stderr, "Usage:\n");
+	fprintf(stderr, "================================================================\n");
+	fprintf(stderr, "DNS Firewall Management Tool\n");
+	fprintf(stderr, "================================================================\n\n");
+	
+	fprintf(stderr, "DENYLIST OPERATIONS (mass blocking):\n");
 	fprintf(stderr, "  Single domain operations:\n");
-	fprintf(stderr, "    %s <map_path> add <domain>\n", prog);
-	fprintf(stderr, "    %s <map_path> delete <domain>\n", prog);
+	fprintf(stderr, "    %s <denylist_map_path> add <domain>\n", prog);
+	fprintf(stderr, "    %s <denylist_map_path> delete <domain>\n", prog);
 	fprintf(stderr, "\n  Batch operations from file:\n");
-	fprintf(stderr, "    %s <map_path> batch-add <file>\n", prog);
-	fprintf(stderr, "    %s <map_path> batch-delete <file>\n", prog);
-	fprintf(stderr, "\n  List all domains:\n");
-	fprintf(stderr, "    %s <map_path> list\n", prog);
-	fprintf(stderr, "\n  Clear all domains:\n");
-	fprintf(stderr, "    %s <map_path> clear\n", prog);
-	fprintf(stderr, "\nOptions:\n");
-	fprintf(stderr, "  <map_path> - BPF map path (e.g., /sys/fs/bpf/dns_fw_denylist)\n");
-	fprintf(stderr, "  <domain>   - Domain name to add/delete (max %d chars total, labels max %d chars)\n", 
-		MAX_DOMAIN_NAME, MAX_DOMAIN_LABEL);
-	fprintf(stderr, "  <file>     - Text file with one domain per line\n");
-	fprintf(stderr, "\nFile format example:\n");
-	fprintf(stderr, "  example.com\n");
-	fprintf(stderr, "  google.com\n");
-	fprintf(stderr, "  # This is a comment\n");
-	fprintf(stderr, "  facebook.com\n");
-	fprintf(stderr, "\nNote: For large files, the program processes domains in\n");
-	fprintf(stderr, "      batches of %d domains at a time.\n", MAX_DOMAINS_PER_BATCH);
-	fprintf(stderr, "\nRFC 1035 Limits:\n");
+	fprintf(stderr, "    %s <denylist_map_path> batch-add <file>\n", prog);
+	fprintf(stderr, "    %s <denylist_map_path> batch-delete <file>\n", prog);
+	fprintf(stderr, "\n  List all denylist domains:\n");
+	fprintf(stderr, "    %s <denylist_map_path> list\n", prog);
+	fprintf(stderr, "\n  Clear all denylist domains:\n");
+	fprintf(stderr, "    %s <denylist_map_path> clear\n", prog);
+	
+	fprintf(stderr, "\n----------------------------------------------------------------\n\n");
+	
+	fprintf(stderr, "CUSTOM DOMAIN OPERATIONS (exceptions/overrides):\n");
+	fprintf(stderr, "  Load from file (format: domain,status):\n");
+	fprintf(stderr, "    %s <custom_map_path> custom-load <file>\n", prog);
+	fprintf(stderr, "\n  Single domain operations:\n");
+	fprintf(stderr, "    %s <custom_map_path> custom-add <domain> <blocked|allowed>\n", prog);
+	fprintf(stderr, "    %s <custom_map_path> custom-update <domain> <blocked|allowed>\n", prog);
+	fprintf(stderr, "    %s <custom_map_path> custom-delete <domain>\n", prog);
+	fprintf(stderr, "\n  List all custom domains:\n");
+	fprintf(stderr, "    %s <custom_map_path> custom-list\n", prog);
+	fprintf(stderr, "\n  Clear all custom domains:\n");
+	fprintf(stderr, "    %s <custom_map_path> custom-clear\n", prog);
+	
+	fprintf(stderr, "\n----------------------------------------------------------------\n\n");
+	
+	fprintf(stderr, "FILE FORMATS:\n");
+	fprintf(stderr, "  Denylist batch file (one domain per line):\n");
+	fprintf(stderr, "    example.com\n");
+	fprintf(stderr, "    google.com\n");
+	fprintf(stderr, "    # This is a comment\n");
+	fprintf(stderr, "    facebook.com\n");
+	fprintf(stderr, "\n  Custom domains file (domain,status format):\n");
+	fprintf(stderr, "    stop1.com,blocked\n");
+	fprintf(stderr, "    allow.com,allowed\n");
+	fprintf(stderr, "    stop.com,blocked\n");
+	fprintf(stderr, "    allow1.com,allowed\n");
+	
+	fprintf(stderr, "\n----------------------------------------------------------------\n\n");
+	
+	fprintf(stderr, "MAP PATHS (typical):\n");
+	fprintf(stderr, "  Denylist map:  /sys/fs/bpf/dns_fw_blocklist\n");
+	fprintf(stderr, "  Custom map:    /sys/fs/bpf/dns_fw_custom_map\n");
+	
+	fprintf(stderr, "\n----------------------------------------------------------------\n\n");
+	
+	fprintf(stderr, "RFC 1035 LIMITS:\n");
 	fprintf(stderr, "  - Maximum total domain name length: %d characters\n", MAX_DOMAIN_NAME);
 	fprintf(stderr, "  - Maximum label length: %d characters\n", MAX_DOMAIN_LABEL);
+	
+	fprintf(stderr, "\nNOTE: Custom domains are checked FIRST and override the denylist.\n");
+	fprintf(stderr, "      Use 'allowed' status to whitelist domains that would otherwise be blocked.\n");
 }
 
 int main(int argc, char *argv[])
@@ -618,29 +867,52 @@ int main(int argc, char *argv[])
 	
 	int ret = 0;
 	
-	if (strcmp(command, "add") == 0 && argc == 4) {
+	// Handle custom domain operations
+	if (strcmp(command, "custom-load") == 0 && argc == 4) {
+		ret = load_custom_domains(argv[3], map_fd);
+	} 
+	else if (strcmp(command, "custom-clear") == 0 && argc == 3) {
+		ret = clear_custom_map(map_fd);
+	}
+	else if (strcmp(command, "custom-list") == 0 && argc == 3) {
+		ret = list_custom_domains(map_fd);
+	}
+	else if ((strcmp(command, "custom-add") == 0 || strcmp(command, "custom-update") == 0) && argc == 5) {
+		ret = manage_custom_domain(map_fd, "add", argv[3], argv[4]);
+	}
+	else if (strcmp(command, "custom-delete") == 0 && argc == 4) {
+		ret = manage_custom_domain(map_fd, "delete", argv[3], NULL);
+	}
+	// Handle denylist operations
+	else if (strcmp(command, "add") == 0 && argc == 4) {
 		ret = manage_single_domain(map_fd, "add", argv[3]);
-	} else if (strcmp(command, "delete") == 0 && argc == 4) {
+	} 
+	else if (strcmp(command, "delete") == 0 && argc == 4) {
 		ret = manage_single_domain(map_fd, "delete", argv[3]);
-	} else if (strcmp(command, "batch-add") == 0 && argc == 4) {
+	} 
+	else if (strcmp(command, "batch-add") == 0 && argc == 4) {
 		int total = load_and_process_domains(argv[3], map_fd, 1);
 		if (total < 0) {
 			ret = -1;
 		} else {
 			printf("Successfully processed %d domains from file\n", total);
 		}
-	} else if (strcmp(command, "batch-delete") == 0 && argc == 4) {
+	} 
+	else if (strcmp(command, "batch-delete") == 0 && argc == 4) {
 		int total = load_and_process_domains(argv[3], map_fd, 0);
 		if (total < 0) {
 			ret = -1;
 		} else {
 			printf("Successfully processed %d domains from file\n", total);
 		}
-	} else if (strcmp(command, "list") == 0 && argc == 3) {
+	} 
+	else if (strcmp(command, "list") == 0 && argc == 3) {
 		ret = list_all_domains(map_fd);
-	} else if (strcmp(command, "clear") == 0 && argc == 3) {
+	} 
+	else if (strcmp(command, "clear") == 0 && argc == 3) {
 		ret = clear_all_domains(map_fd);
-	} else {
+	} 
+	else {
 		fprintf(stderr, "Invalid command or arguments\n");
 		print_usage(argv[0]);
 		ret = 1;

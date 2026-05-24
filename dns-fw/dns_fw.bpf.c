@@ -51,7 +51,7 @@ struct meta_data {
 	__u16 unused;
 };
 
-/* Define the Hash Map for domain names */
+/* Define the Hash Map for domain names (blocklist) */
 struct domain_key {
 	char data[MAX_DOMAIN_NAME + 1];  /* +1 for null terminator */
 };
@@ -63,6 +63,16 @@ struct {
 	__uint(max_entries, 1500000);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } dns_fw_blocklist SEC(".maps");
+
+/* Define the Hash Map for custom domain exceptions/overrides */
+/* 0 = allowed (whitelist override), 1 = blocked (blacklist override) */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, struct domain_key);
+	__type(value, __u8);
+	__uint(max_entries, 10000);  /* 10k entries is plenty for exceptions */
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} dns_fw_custom_map SEC(".maps");
 
 /*
  * DEBUG: ringbuf was removed because bpf_ringbuf_reserve() returns NULL
@@ -356,8 +366,11 @@ int dns_fw(struct xdp_md *ctx)
 			 *	bpf_printk("DNS_FW_DEBUG key[12-13]: %02x %02x",
 			 *		   (unsigned char)dkey.data[12],
 			 *		   (unsigned char)dkey.data[13]);
+			 *	if (bpf_map_lookup_elem(&dns_fw_custom_map, &dkey)) {
+			 *		bpf_printk("DNS_FW_DEBUG letsbond.com HIT (custom)");
+			 *	}
 			 *	if (bpf_map_lookup_elem(&dns_fw_blocklist, &dkey)) {
-			 *		bpf_printk("DNS_FW_DEBUG letsbond.com HIT -> XDP_DROP");
+			 *		bpf_printk("DNS_FW_DEBUG letsbond.com HIT (blocklist) -> XDP_DROP");
 			 *		return XDP_DROP;
 			 *	}
 			 *	bpf_printk("DNS_FW_DEBUG letsbond.com MISS -> XDP_PASS");
@@ -366,6 +379,18 @@ int dns_fw(struct xdp_md *ctx)
 			 *
 			 * DEBUG_PRINTK_END */
 
+			/* Check custom map first (exceptions/overrides) */
+			__u8 *custom_status = bpf_map_lookup_elem(&dns_fw_custom_map, &dkey);
+			if (custom_status) {
+				/* Domain found in custom map */
+				if (*custom_status == 1) {
+					return XDP_DROP;  /* blocked by custom rule */
+				} else {
+					return XDP_PASS;  /* allowed by custom rule (whitelist override) */
+				}
+			}
+
+			/* If not in custom map, check the blocklist */
 			if (bpf_map_lookup_elem(&dns_fw_blocklist, &dkey)) {
 				return XDP_DROP;
 			}
