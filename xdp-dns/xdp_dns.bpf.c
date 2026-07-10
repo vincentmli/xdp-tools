@@ -18,6 +18,7 @@
 
 #include "vmlinux_local.h"
 #include <bpf/bpf_helpers.h>
+#include <xdp/xdp_helpers.h>
 #include <bpf/bpf_endian.h>
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
@@ -43,14 +44,29 @@
 #define memcpy __builtin_memcpy
 #define MAX_DOMAIN_SIZE 63
 
-struct meta_data {
-	__u16 eth_proto;
-	__u16 ip_pos;
-	__u16 opt_pos;
-	__u16 unused;
-};
+/* ======================================================
+ * CHAIN CALL ACTIONS CONFIGURATION - CRITICAL SECTION
+ * ======================================================
+ * This config tells the xdp_dispatcher how to handle
+ * different return codes from this program.
+ *
+ * IMPORTANT: By default, XDP_PASS continues the chain.
+ * We're remapping it so:
+ *   - XDP_PASS = STOP (go directly to network stack)
+ *   - XDP_REDIRECT = CONTINUE (go to next program in chain)
+ *
+ * This allows us to skip subsequent programs for allowed domains.
+ */
+struct {
+	__uint(priority, 60);    // Keep your current priority from xdp-loader status
+	__uint(XDP_PASS, 0);     // XDP_PASS now means STOP (skip rest of chain, go to stack)
+	__uint(XDP_REDIRECT, 1); // XDP_REDIRECT now means CONTINUE to next programs
+	__uint(XDP_DROP, 0);     // DROP always stops the chain anyway
+	__uint(XDP_TX, 0);       // TX also stops the chain
+	__uint(XDP_ABORTED, 0);  // ABORTED stops the chain
+} XDP_RUN_CONFIG(xdp_dns_denylist);
 
-/* Define the LPM Trie Map for domain names */
+/* Define the LPM Trie Map for denylist (blocked domains) */
 struct domain_key {
 	struct bpf_lpm_trie_key lpm_key;
 	char data[MAX_DOMAIN_SIZE + 1];
@@ -65,6 +81,16 @@ struct {
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 } domain_denylist SEC(".maps");
 
+/* NEW: Define the LPM Trie Map for allowed domains (whitelist) */
+struct {
+	__uint(type, BPF_MAP_TYPE_LPM_TRIE);
+	__type(key, struct domain_key);
+	__type(value, __u8);
+	__uint(max_entries, 10000);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} domain_allowlist SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 1 << 12); // 4KB buffer
@@ -74,6 +100,8 @@ struct {
 struct qname_event {
 	__u8 len;
 	__u32 src_ip; // Store IPv4 address
+	__u8 blocked; // NEW: flag to indicate if domain was blocked
+	__u8 allowed; // NEW: flag to indicate if domain was allowed
 	char qname[MAX_DOMAIN_SIZE + 1];
 };
 
@@ -251,6 +279,7 @@ int xdp_dns_denylist(struct xdp_md *ctx)
 	__u16 eth_proto;
 	__u8 len = 0;
 	int is_blocked = 0;  // Track if domain should be blocked
+	int is_allowed = 0;  // NEW: Track if domain is allowed (whitelisted)
 
 	struct domain_key dkey = { 0 }; // LPM trie key
 
@@ -288,44 +317,73 @@ int xdp_dns_denylist(struct xdp_md *ctx)
 			int copy_len = len < MAX_DOMAIN_SIZE ? len :
 							       MAX_DOMAIN_SIZE;
 
-			// FIRST: Check if domain should be blocked (CRITICAL PATH)
+			// Prepare domain key for both blocklist and allowlist checks
 			custom_memcpy(dkey.data, qname, copy_len);
 			dkey.data[MAX_DOMAIN_SIZE] = '\0';
 			reverse_string(dkey.data, copy_len);
 			dkey.lpm_key.prefixlen = copy_len * 8;
 
-			// Determine if this domain is blocked
-			if (bpf_map_lookup_elem(&domain_denylist, &dkey)) {
-				is_blocked = 1;
+			// FIRST: Check if domain is ALLOWED (whitelist)
+			// This check should happen BEFORE blocklist check
+			// so allowed domains bypass blocking
+			if (bpf_map_lookup_elem(&domain_allowlist, &dkey)) {
+				is_allowed = 1;
 			}
 
-			// NOW handle logging (optional, but try for ALL queries)
+			// SECOND: If not allowed, check if domain is BLOCKED
+			if (!is_allowed) {
+				if (bpf_map_lookup_elem(&domain_denylist, &dkey)) {
+					is_blocked = 1;
+				}
+			}
+
+			// Log the event with both allowed and blocked flags
 			struct qname_event *event = bpf_ringbuf_reserve(
 				&dns_ringbuf, sizeof(*event), 0);
 
 			if (event) {
 				event->len = copy_len;
 				event->src_ip = ipv4->saddr;
+				event->blocked = is_blocked;
+				event->allowed = is_allowed;
 				custom_memcpy(event->qname, qname, copy_len);
 				event->qname[copy_len] = '\0';
 				
-				// Optional: Add a field to indicate if blocked
-				// event->blocked = is_blocked;
-				
 				bpf_ringbuf_submit(event, 0);
 			} else {
-				// Logging failed, but that's OK - we still know if we should block
-				bpf_printk("Ringbuf full, but continuing with blocklist check");
+				bpf_printk("Ringbuf full, but continuing with allowlist/blocklist check");
 			}
 
-			// FINALLY: Take action based on blocklist result
-			if (is_blocked) {
+			/* ===================================================
+			 * CHAIN CONTROL LOGIC - THIS IS THE KEY PART
+			 * ===================================================
+			 * 
+			 * is_allowed == 1: Return XDP_PASS → STOP chain,
+			 * go directly to network stack (skips next programs)
+			 * 
+			 * is_blocked == 1: Return XDP_DROP → Drop packet
+			 * 
+			 * Default: Return XDP_REDIRECT → CONTINUE chain
+			 * (goes to xdp_tls_sni program next)
+			 */
+			if (is_allowed) {
+				// ALLOWED: Skip the rest of the chain
+				// XDP_PASS is remapped to STOP the chain
+				return XDP_PASS;
+			} else if (is_blocked) {
+				// BLOCKED: Drop the packet
 				return XDP_DROP;
+			} else {
+				// Neither allowed nor blocked: Continue chain
+				// XDP_REDIRECT is remapped to CONTINUE
+				return XDP_REDIRECT;
 			}
 			break;
 		}
 	}
-	return XDP_PASS;
+	// Non-DNS or non-IP packets: Continue chain by default
+	// Return XDP_REDIRECT to continue processing
+	return XDP_REDIRECT;
 }
 
 char _license[] SEC("license") = "GPL";
