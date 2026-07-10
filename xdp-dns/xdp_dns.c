@@ -21,8 +21,10 @@
 #include <string.h>
 #include <errno.h>
 #include <stdlib.h>
+#include <getopt.h>
+#include <unistd.h>  // Added for close()
 
-#define MAX_DOMAIN_SIZE 63 // Increased size to handle larger domains
+#define MAX_DOMAIN_SIZE 63
 
 struct domain_key {
 	struct bpf_lpm_trie_key lpm_key;
@@ -66,56 +68,164 @@ static void reverse_string(char *str)
 	}
 }
 
+static void print_usage(const char *prog_name)
+{
+	fprintf(stderr, "Usage: %s [OPTIONS] <command> <domain>\n", prog_name);
+	fprintf(stderr, "\nOptions:\n");
+	fprintf(stderr, "  -m, --map PATH    Path to the BPF map (required)\n");
+	fprintf(stderr, "  -d, --denylist    Operate on denylist (default)\n");
+	fprintf(stderr, "  -a, --allowlist   Operate on allowlist\n");
+	fprintf(stderr, "  -h, --help        Show this help message\n");
+	fprintf(stderr, "\nCommands:\n");
+	fprintf(stderr, "  add    Add domain to the specified list\n");
+	fprintf(stderr, "  delete Remove domain from the specified list\n");
+	fprintf(stderr, "  list   List all domains in the specified list\n");
+	fprintf(stderr, "\nExamples:\n");
+	fprintf(stderr, "  %s -m /sys/fs/bpf/domain_denylist add google.com\n", prog_name);
+	fprintf(stderr, "  %s -m /sys/fs/bpf/domain_allowlist add trusted.com\n", prog_name);
+	fprintf(stderr, "  %s -m /sys/fs/bpf/domain_denylist delete bad.com\n", prog_name);
+	fprintf(stderr, "  %s -m /sys/fs/bpf/domain_allowlist list\n", prog_name);
+}
+
 int main(int argc, char *argv[])
 {
 	int map_fd;
 	struct domain_key dkey = { 0 };
 	__u8 value = 1;
+	int opt;
+	const char *map_path = NULL;
+	const char *command = NULL;
+	const char *domain = NULL;
 
-	// Check for proper number of arguments
-	if (argc != 4) {
-		fprintf(stderr, "Usage: %s <map_path> <add|delete> <domain>\n", argv[0]);
-		return 1;
-	}
+	// Parse command line options
+	static struct option long_options[] = {
+		{"map", required_argument, 0, 'm'},
+		{"denylist", no_argument, 0, 'd'},
+		{"allowlist", no_argument, 0, 'a'},
+		{"help", no_argument, 0, 'h'},
+		{0, 0, 0, 0}
+	};
 
-	// Encode the domain name with label lengths
-	encode_domain(argv[3], dkey.data);
-	reverse_string(dkey.data);
-
-	// Set the LPM trie key prefix length
-	dkey.lpm_key.prefixlen = strlen(dkey.data) * 8;
-
-	// Open the BPF map
-	const char *map_path = argv[1];
-	map_fd = bpf_obj_get(map_path);
-	if (map_fd < 0) {
-		fprintf(stderr, "Failed to open map at %s: %s\n", map_path, strerror(errno));
-		return 1;
-	}
-
-	// Add or delete the domain based on the first argument
-	if (strcmp(argv[2], "add") == 0) {
-		// Update the map with the encoded domain name
-		if (bpf_map_update_elem(map_fd, &dkey, &value, BPF_ANY) != 0) {
-			fprintf(stderr, "Failed to add domain to map: %s\n",
-				strerror(errno));
+	while ((opt = getopt_long(argc, argv, "m:dah", long_options, NULL)) != -1) {
+		switch (opt) {
+		case 'm':
+			map_path = optarg;
+			break;
+		case 'd':
+			// Denylist (for display purposes only - the map path determines the actual map)
+			break;
+		case 'a':
+			// Allowlist (for display purposes only - the map path determines the actual map)
+			break;
+		case 'h':
+			print_usage(argv[0]);
+			return 0;
+		default:
+			print_usage(argv[0]);
 			return 1;
 		}
-		printf("Domain %s added to denylist\n", argv[3]);
-	} else if (strcmp(argv[2], "delete") == 0) {
+	}
+
+	// Check if map path was provided
+	if (map_path == NULL) {
+		fprintf(stderr, "Error: Map path is required. Use -m or --map option.\n");
+		print_usage(argv[0]);
+		return 1;
+	}
+
+	// Check for required arguments (command and domain for add/delete)
+	if (optind >= argc) {
+		fprintf(stderr, "Error: Missing command argument\n");
+		print_usage(argv[0]);
+		return 1;
+	}
+
+	command = argv[optind];
+
+	// For add/delete commands, we need a domain
+	if (strcmp(command, "add") == 0 || strcmp(command, "delete") == 0) {
+		if (optind + 1 >= argc) {
+			fprintf(stderr, "Error: Missing domain argument for '%s' command\n", command);
+			print_usage(argv[0]);
+			return 1;
+		}
+		domain = argv[optind + 1];
+		
+		// Encode the domain name with label lengths
+		encode_domain(domain, dkey.data);
+		reverse_string(dkey.data);
+
+		// Set the LPM trie key prefix length
+		dkey.lpm_key.prefixlen = strlen(dkey.data) * 8;
+	} else if (strcmp(command, "list") != 0) {
+		fprintf(stderr, "Error: Unknown command '%s'. Use 'add', 'delete', or 'list'.\n",
+			command);
+		print_usage(argv[0]);
+		return 1;
+	}
+
+	// Open the BPF map
+	map_fd = bpf_obj_get(map_path);
+	if (map_fd < 0) {
+		fprintf(stderr, "Failed to open map at '%s': %s\n", map_path, strerror(errno));
+		fprintf(stderr, "Make sure the XDP program is loaded and the map is pinned\n");
+		return 1;
+	}
+
+	// Execute the command
+	if (strcmp(command, "add") == 0) {
+		// Update the map with the encoded domain name
+		if (bpf_map_update_elem(map_fd, &dkey, &value, BPF_ANY) != 0) {
+			fprintf(stderr, "Failed to add domain '%s' to map '%s': %s\n",
+				domain, map_path, strerror(errno));
+			close(map_fd);
+			return 1;
+		}
+		printf("Domain '%s' added to %s\n", domain, map_path);
+	} else if (strcmp(command, "delete") == 0) {
 		// Remove the domain from the map
 		if (bpf_map_delete_elem(map_fd, &dkey) != 0) {
 			fprintf(stderr,
-				"Failed to remove domain from map: %s\n",
-				strerror(errno));
+				"Failed to remove domain '%s' from map '%s': %s\n",
+				domain, map_path, strerror(errno));
+			close(map_fd);
 			return 1;
 		}
-		printf("Domain %s removed from denylist\n", argv[3]);
-	} else {
-		fprintf(stderr, "Invalid command: %s. Use 'add' or 'delete'.\n",
-			argv[2]);
-		return 1;
+		printf("Domain '%s' removed from %s\n", domain, map_path);
+	} else if (strcmp(command, "list") == 0) {
+		// List all domains in the map
+		struct domain_key next_key = { 0 };
+		char decoded_domain[MAX_DOMAIN_SIZE + 1];
+		int found = 0;
+		int err;
+
+		printf("Domains in map '%s':\n", map_path);
+		
+		while ((err = bpf_map_get_next_key(map_fd, &next_key, &next_key)) == 0) {
+			// Decode the domain for display
+			char *src = next_key.data;
+			char *dst = decoded_domain;
+			int first = 1;
+			
+			while (*src) {
+				int len = *src++;
+				if (!first) *dst++ = '.';
+				memcpy(dst, src, len);
+				dst += len;
+				src += len;
+				first = 0;
+			}
+			*dst = '\0';
+			
+			printf("  %s\n", decoded_domain);
+			found = 1;
+		}
+		
+		if (!found) {
+			printf("  (empty)\n");
+		}
 	}
 
+	close(map_fd);
 	return 0;
 }
