@@ -16,51 +16,79 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include <syslog.h>
+#include <stdint.h>
+#include <signal.h>
+#include <errno.h>
 
 #define MAX_DOMAIN_SIZE 63
 
+// Structure must match exactly with BPF program
 struct qname_event {
-	__u8 len;
-	__u32 src_ip; // IPv4 address
+	uint8_t len;
+	uint32_t src_ip;
+	uint8_t blocked;
+	uint8_t allowed;
 	char qname[MAX_DOMAIN_SIZE + 1];
 };
 
-// Helper function to convert DNS label to a standard domain format
+static volatile int running = 1;
+
+// Signal handler for graceful shutdown
+void signal_handler(int sig)
+{
+	if (sig == SIGINT || sig == SIGTERM) {
+		running = 0;
+	}
+}
+
+// Helper function to convert DNS label format to dot notation
 void dns_label_to_dot_notation(char *dns_name, char *output, size_t len)
 {
 	size_t pos = 0, out_pos = 0;
 
 	while (pos < len) {
-		__u8 label_len = dns_name[pos];
-		if (label_len == 0 || pos + label_len + 1 > len || out_pos + label_len >= MAX_DOMAIN_SIZE) {
-			break; // Prevent buffer overflow
+		uint8_t label_len = dns_name[pos];
+		
+		if (label_len == 0) {
+			break; // End of domain name
 		}
-
+		
+		if (pos + label_len + 1 > len) {
+			break; // Buffer overflow protection
+		}
+		
 		if (out_pos != 0) {
-			output[out_pos++] = '.'; // Add a dot between labels
+			output[out_pos++] = '.';
 		}
-
+		
 		// Copy the label
 		for (size_t i = 1; i <= label_len; i++) {
+			if (out_pos >= MAX_DOMAIN_SIZE) {
+				break;
+			}
 			output[out_pos++] = dns_name[pos + i];
 		}
-
+		
 		pos += label_len + 1;
 	}
 
-	output[out_pos] = '\0'; // Null-terminate the result
+	output[out_pos] = '\0';
 }
 
-// Corrected handle_event function to match the signature expected by ring_buffer__new
+// Handle event from ring buffer
 int handle_event(void *ctx __attribute__((unused)), void *data,
 		 size_t data_sz)
 {
 	if (data_sz < sizeof(struct qname_event)) {
-		syslog(LOG_ERR, "Unexpected data size: %zu", data_sz);
+		syslog(LOG_ERR, "Unexpected data size: %zu (expected at least %zu)", 
+		       data_sz, sizeof(struct qname_event));
 		return -1;
 	}
 
@@ -77,19 +105,35 @@ int handle_event(void *ctx __attribute__((unused)), void *data,
 		return -1;
 	}
 
-	char domain_str[MAX_DOMAIN_SIZE + 1] = { 0 }; // +1 for null terminator
-	dns_label_to_dot_notation(event->qname, domain_str, event->len);
+	char domain_str[MAX_DOMAIN_SIZE + 1] = { 0 };
+	
+	if (event->len > 0) {
+		dns_label_to_dot_notation(event->qname, domain_str, event->len);
+	} else {
+		strcpy(domain_str, "(empty)");
+	}
 
-	syslog(LOG_INFO, "Received qname: %s from source IP: %s", domain_str,
-	       src_ip_str);
+	// Determine status
+	const char *status;
+	if (event->allowed) {
+		status = "ALLOWED (bypass chain)";
+	} else if (event->blocked) {
+		status = "BLOCKED";
+	} else {
+		status = "PASS (continuing chain)";
+	}
 
-	return 0; // Return 0 to indicate success
+	syslog(LOG_INFO, "DNS: %s | Source: %s | Status: %s", 
+	       domain_str, src_ip_str, status);
+
+	return 0;
 }
 
 int main(int argc, char *argv[])
 {
 	if (argc != 2) {
 		fprintf(stderr, "Usage: %s <path_to_ringbuf>\n", argv[0]);
+		fprintf(stderr, "Example: %s /sys/fs/bpf/xdp-dns-denylist/dns_ringbuf\n", argv[0]);
 		return 1;
 	}
 
@@ -97,29 +141,49 @@ int main(int argc, char *argv[])
 	struct ring_buffer *rb;
 	int ringbuf_fd;
 
-	openlog("qname_logger", LOG_CONS | LOG_PID | LOG_NDELAY, LOG_LOCAL1);
+	// Set up signal handlers
+	signal(SIGINT, signal_handler);
+	signal(SIGTERM, signal_handler);
+
+	// Open syslog
+	openlog("xdp_dns_log", LOG_CONS | LOG_PID | LOG_NDELAY, LOG_LOCAL1);
 
 	// Open the ring buffer
 	ringbuf_fd = bpf_obj_get(ringbuf_path);
 	if (ringbuf_fd < 0) {
-		perror("Failed to open ring buffer");
+		syslog(LOG_ERR, "Failed to open ring buffer at %s: %m", ringbuf_path);
+		closelog();
 		return 1;
 	}
 
-	// Set up ring buffer polling with the corrected function signature
+	// Set up ring buffer polling
 	rb = ring_buffer__new(ringbuf_fd, handle_event, NULL, NULL);
 	if (!rb) {
-		perror("Failed to create ring buffer");
+		syslog(LOG_ERR, "Failed to create ring buffer: %m");
+		close(ringbuf_fd);
+		closelog();
 		return 1;
 	}
 
-	// Poll the ring buffer
-	while (1) {
-		ring_buffer__poll(rb, -1); // Block indefinitely
+	syslog(LOG_INFO, "XDP DNS logger started, monitoring %s", ringbuf_path);
+
+	// Main polling loop
+	while (running) {
+		int err = ring_buffer__poll(rb, 1000); // Poll with 1 second timeout
+		if (err < 0) {
+			if (errno == EINTR) {
+				// Interrupted by signal, continue
+				continue;
+			}
+			syslog(LOG_ERR, "Ring buffer poll error: %d", err);
+			break;
+		}
 	}
 
+	syslog(LOG_INFO, "XDP DNS logger stopped");
+
 	ring_buffer__free(rb);
+	close(ringbuf_fd);
 	closelog();
 	return 0;
 }
-
