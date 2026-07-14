@@ -22,7 +22,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <getopt.h>
-#include <unistd.h>  // Added for close()
+#include <unistd.h>
 
 #define MAX_DOMAIN_SIZE 63
 
@@ -85,6 +85,72 @@ static void print_usage(const char *prog_name)
 	fprintf(stderr, "  %s -m /sys/fs/bpf/domain_allowlist add trusted.com\n", prog_name);
 	fprintf(stderr, "  %s -m /sys/fs/bpf/domain_denylist delete bad.com\n", prog_name);
 	fprintf(stderr, "  %s -m /sys/fs/bpf/domain_allowlist list\n", prog_name);
+}
+
+// Function to decode a domain from the map (encoded with label lengths and reversed)
+static int decode_domain_encoded(const char *src, char *dst, size_t dst_size)
+{
+	if (!src || !dst || dst_size == 0) {
+		return -1;
+	}
+	
+	// Clear the destination buffer
+	memset(dst, 0, dst_size);
+	
+	// First, reverse the entire encoded string
+	char reversed[MAX_DOMAIN_SIZE + 1];
+	memset(reversed, 0, sizeof(reversed));
+	
+	int len = 0;
+	while (src[len] && len < MAX_DOMAIN_SIZE) {
+		len++;
+	}
+	
+	if (len == 0) {
+		return -1;
+	}
+	
+	// Reverse the string
+	for (int i = 0; i < len; i++) {
+		reversed[i] = src[len - 1 - i];
+	}
+	reversed[len] = '\0';
+	
+	// Now decode the label length encoding
+	char *ptr = reversed;
+	char *dst_ptr = dst;
+	int first = 1;
+	
+	while (*ptr) {
+		int label_len = (unsigned char)*ptr++;
+		
+		// Check for valid label length
+		if (label_len <= 0 || label_len > 63) {
+			break;
+		}
+		
+		// Add dot between labels
+		if (!first) {
+			if (dst_ptr < dst + dst_size - 1) {
+				*dst_ptr++ = '.';
+			} else {
+				break;
+			}
+		}
+		first = 0;
+		
+		// Copy the label
+		if (dst_ptr + label_len <= dst + dst_size - 1) {
+			memcpy(dst_ptr, ptr, label_len);
+			dst_ptr += label_len;
+			ptr += label_len;
+		} else {
+			break;
+		}
+	}
+	
+	*dst_ptr = '\0';
+	return 0;
 }
 
 int main(int argc, char *argv[])
@@ -194,6 +260,7 @@ int main(int argc, char *argv[])
 		printf("Domain '%s' removed from %s\n", domain, map_path);
 	} else if (strcmp(command, "list") == 0) {
 		// List all domains in the map
+		struct domain_key cur_key = { 0 };
 		struct domain_key next_key = { 0 };
 		char decoded_domain[MAX_DOMAIN_SIZE + 1];
 		int found = 0;
@@ -201,24 +268,19 @@ int main(int argc, char *argv[])
 
 		printf("Domains in map '%s':\n", map_path);
 		
-		while ((err = bpf_map_get_next_key(map_fd, &next_key, &next_key)) == 0) {
-			// Decode the domain for display
-			char *src = next_key.data;
-			char *dst = decoded_domain;
-			int first = 1;
-			
-			while (*src) {
-				int len = *src++;
-				if (!first) *dst++ = '.';
-				memcpy(dst, src, len);
-				dst += len;
-				src += len;
-				first = 0;
+		// Start with a zero key to get the first entry
+		memset(&cur_key, 0, sizeof(cur_key));
+		
+		while ((err = bpf_map_get_next_key(map_fd, &cur_key, &next_key)) == 0) {
+			// Decode the domain (encoded with label lengths and reversed)
+			if (decode_domain_encoded(next_key.data, decoded_domain, sizeof(decoded_domain)) == 0) {
+				printf("  %s\n", decoded_domain);
+				found = 1;
 			}
-			*dst = '\0';
 			
-			printf("  %s\n", decoded_domain);
-			found = 1;
+			// Copy next_key to cur_key for the next iteration
+			memcpy(&cur_key, &next_key, sizeof(cur_key));
+			memset(&next_key, 0, sizeof(next_key));
 		}
 		
 		if (!found) {
