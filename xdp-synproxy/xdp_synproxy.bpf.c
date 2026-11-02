@@ -392,6 +392,10 @@ static __always_inline int tcp_dissect(void *data, void *data_end,
 		if (hdr->ipv4->version != 4)
 			return XDP_DROP;
 
+		/* Mitigation for CVE-2026-98432: drop IPv4 packets carrying options */
+		if (hdr->ipv4->ihl > 5)
+			return XDP_DROP;
+
 		if (hdr->ipv4->protocol != IPPROTO_TCP)
 			return XDP_PASS;
 
