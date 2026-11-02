@@ -9,7 +9,9 @@
 #include <unistd.h>
 #include <getopt.h>
 #include <signal.h>
+#include <fcntl.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <xdp/libxdp.h>
@@ -54,6 +56,8 @@ static noreturn void help(const char *progname)
 {
 	fprintf(stderr, "Usage: %s [--iface <iface>|--prog <prog_id>] [--mss4 <mss ipv4> --mss6 <mss ipv6> --wscale <wscale> --ttl <ttl>] [--ports <port1>,<port2>,...]\n",
 		progname);
+	fprintf(stderr, "       %s [--daemon [--pidfile <file>] [--logfile <file>]] ...\n",
+		progname);
 	exit(1);
 }
 
@@ -71,7 +75,8 @@ static unsigned long parse_arg_ul(const char *progname, const char *arg, unsigne
 }
 
 static void parse_options(int argc, char *argv[], unsigned int *ifindex, __u32 *prog_id,
-			  __u64 *tcpipopts, char **ports)
+			  __u64 *tcpipopts, char **ports,
+			  bool *daemon_mode, char **pidfile, char **logfile)
 {
 	static struct option long_options[] = {
 		{ "help", no_argument, NULL, 'h' },
@@ -82,11 +87,17 @@ static void parse_options(int argc, char *argv[], unsigned int *ifindex, __u32 *
 		{ "wscale", required_argument, NULL, 'w' },
 		{ "ttl", required_argument, NULL, 't' },
 		{ "ports", required_argument, NULL, 'p' },
+		{ "daemon", no_argument, NULL, 'd' },
+		{ "pidfile", required_argument, NULL, 'P' },
+		{ "logfile", required_argument, NULL, 'L' },
 		{ NULL, 0, NULL, 0 },
 	};
 
 	unsigned long mss4 = 0, mss6 = 0, wscale = 0, ttl = 0;
 	unsigned int tcpipopts_mask = 0;
+	bool dm = false;
+	char *pf = NULL;
+	char *lf = NULL;
 
 	if (argc < 2)
 		help(argv[0]);
@@ -136,6 +147,15 @@ static void parse_options(int argc, char *argv[], unsigned int *ifindex, __u32 *
 		case 'p':
 			*ports = optarg;
 			break;
+		case 'd':
+			dm = true;
+			break;
+		case 'P':
+			pf = optarg;
+			break;
+		case 'L':
+			lf = optarg;
+			break;
 		default:
 			help(argv[0]);
 		}
@@ -161,6 +181,99 @@ static void parse_options(int argc, char *argv[], unsigned int *ifindex, __u32 *
 		help(argv[0]);
 	if (*ifindex == 0 && *prog_id == 0)
 		help(argv[0]);
+
+	*daemon_mode = dm;
+	*pidfile = pf;
+	*logfile = lf;
+}
+
+static int daemonize(const char *pidfile, const char *logfile)
+{
+	int fd;
+
+	/* Fork and let the parent exit so the child is not a process group leader */
+	switch (fork()) {
+	case -1:
+		perror("fork");
+		return -1;
+	case 0:
+		break;
+	default:
+		_exit(0);
+	}
+
+	if (setsid() < 0) {
+		perror("setsid");
+		return -1;
+	}
+
+	/* Ignore SIGHUP so the daemon survives terminal hangup */
+	signal(SIGHUP, SIG_IGN);
+
+	/* Second fork to ensure the daemon cannot acquire a controlling terminal */
+	switch (fork()) {
+	case -1:
+		perror("fork");
+		return -1;
+	case 0:
+		break;
+	default:
+		_exit(0);
+	}
+
+	umask(0);
+	if (chdir("/") < 0) {
+		perror("chdir");
+		return -1;
+	}
+
+	/* Redirect stdin/stdout/stderr */
+	fd = open("/dev/null", O_RDWR);
+	if (fd < 0) {
+		perror("open /dev/null");
+		return -1;
+	}
+	dup2(fd, STDIN_FILENO);
+
+	if (logfile) {
+		int lfd = open(logfile, O_WRONLY | O_CREAT | O_APPEND, 0644);
+
+		if (lfd < 0) {
+			perror("open logfile");
+			return -1;
+		}
+		dup2(lfd, STDOUT_FILENO);
+		dup2(lfd, STDERR_FILENO);
+		if (lfd > STDERR_FILENO)
+			close(lfd);
+	} else {
+		dup2(fd, STDOUT_FILENO);
+		dup2(fd, STDERR_FILENO);
+	}
+	if (fd > STDERR_FILENO)
+		close(fd);
+
+	/* Write PID file so the daemon can be stopped later */
+	if (pidfile) {
+		char buf[32];
+		int pfd;
+		int len;
+
+		pfd = open(pidfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (pfd < 0) {
+			perror("open pidfile");
+			return -1;
+		}
+		len = snprintf(buf, sizeof(buf), "%d\n", getpid());
+		if (write(pfd, buf, len) != len) {
+			perror("write pidfile");
+			close(pfd);
+			return -1;
+		}
+		close(pfd);
+	}
+
+	return 0;
 }
 
 static int syncookie_attach(unsigned int ifindex)
@@ -305,9 +418,13 @@ int main(int argc, char *argv[])
 	__u64 prevcnt;
 	__u32 prog_id;
 	char *ports;
+	char *pidfile = NULL;
+	char *logfile = NULL;
+	bool daemon_mode = false;
 	int err = 0;
 
-	parse_options(argc, argv, &ifindex, &prog_id, &tcpipopts, &ports);
+	parse_options(argc, argv, &ifindex, &prog_id, &tcpipopts, &ports,
+		      &daemon_mode, &pidfile, &logfile);
 
 	if (prog_id == 0) {
 		err = syncookie_attach(ifindex);
@@ -365,6 +482,13 @@ int main(int argc, char *argv[])
 
 	if ((ports || tcpipopts) && attached_prog_id == 0)
 		goto out_close_maps;
+
+	/* Daemonize after all setup is complete and before the stats loop */
+	if (daemon_mode) {
+		err = daemonize(pidfile, logfile);
+		if (err < 0)
+			goto out_close_maps;
+	}
 
 	prevcnt = 0;
 	firstiter = true;
